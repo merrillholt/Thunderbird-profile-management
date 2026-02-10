@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Thunderbird Profile Auditor
+# Finds orphaned directories, broken references, and shows disk usage
+
+show_sizes=true
+fix_mode=false
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Audit Thunderbird profiles across all installation types (system, flatpak, snap).
+Identifies orphaned directories, broken references, and disk usage.
+
+Options:
+  --no-sizes   Skip calculating directory sizes (faster)
+  --fix        Interactive mode to remove orphaned/unused directories
+  -h, --help   Show this help
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        --no-sizes) show_sizes=false ;;
+        --fix) fix_mode=true ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "Error: Unknown option: ${arg}" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Colors for output
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    BOLD=''
+    NC=''
+fi
+
+# Installation types and their profile directories
+declare -A tb_dirs=(
+    ["System"]="${HOME}/.thunderbird"
+    ["Flatpak"]="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+    ["Snap"]="${HOME}/snap/thunderbird/common/.thunderbird"
+)
+
+# Check if installation type is present
+is_installed() {
+    local tb_type="$1"
+    case "${tb_type}" in
+        System)
+            command -v thunderbird &>/dev/null && [[ ! $(which thunderbird) =~ snap ]]
+            ;;
+        Flatpak)
+            command -v flatpak &>/dev/null && flatpak info org.mozilla.Thunderbird &>/dev/null 2>&1
+            ;;
+        Snap)
+            snap list thunderbird &>/dev/null 2>&1
+            ;;
+    esac
+}
+
+# Get directory size
+get_size() {
+    local dir="$1"
+    if "${show_sizes}" && [[ -d "${dir}" ]]; then
+        du -sh "${dir}" 2>/dev/null | cut -f1
+    else
+        echo "—"
+    fi
+}
+
+get_mtime_display() {
+    local dir="$1"
+    if [[ -d "${dir}" ]]; then
+        stat -c '%y' "${dir}" 2>/dev/null | cut -d'.' -f1
+    else
+        echo "—"
+    fi
+}
+
+list_profile_dirs_mtime() {
+    local tb_dir="$1"
+    local found=false
+    while IFS= read -r -d '' dir; do
+        local mtime
+        mtime=$(get_mtime_display "${dir}")
+        echo "  Dir: ${dir}  mtime: ${mtime}"
+        found=true
+    done < <(find "${tb_dir}" -maxdepth 1 -mindepth 1 -type d ! -name "Crash Reports" ! -name "Pending Pings" -print0 2>/dev/null)
+    if ! "${found}"; then
+        echo "  No profile directories found"
+    fi
+}
+
+get_subdir_size() {
+    local dir="$1"
+    if [[ -d "${dir}" ]]; then
+        du -sh "${dir}" 2>/dev/null | cut -f1
+    else
+        echo "—"
+    fi
+}
+
+# Parse profiles.ini and return declared profiles
+# Output format: profile_name|path|is_relative|is_default
+parse_profiles_ini() {
+    local profiles_ini="$1"
+    [[ -f "${profiles_ini}" ]] || return
+
+    awk -F= '
+        /^\[Profile[0-9]+\]/ {
+            if (name != "") print name "|" path "|" rel "|" def
+            name=""; path=""; rel="1"; def="0"
+        }
+        /^Name=/ { name=$2 }
+        /^Path=/ { path=$2 }
+        /^IsRelative=/ { rel=$2 }
+        /^Default=1/ { def="1" }
+        END {
+            if (name != "") print name "|" path "|" rel "|" def
+        }
+    ' "${profiles_ini}"
+}
+
+# Get active profile from Install section
+get_active_profile_install() {
+    local profiles_ini="$1"
+    [[ -f "${profiles_ini}" ]] || return
+
+    awk -F= '/^\[Install/{found=1} found && /^Default=/{print $2; exit}' "${profiles_ini}"
+}
+
+# Strict validation for profiles.ini
+validate_profiles_ini() {
+    local profiles_ini="$1"
+    local tb_dir="$2"
+
+    [[ -f "${profiles_ini}" ]] || return
+
+    local section=""
+    local section_line=0
+    local prof_name=""
+    local prof_path=""
+    local prof_rel=""
+    local prof_default=""
+    local install_default=""
+    local install_line=0
+    local error_count=0
+    local warn_count=0
+    local prof_index=""
+    declare -A seen_profile_sections
+    declare -A profile_full_paths
+
+    finish_profile_section() {
+        if [[ "${section}" =~ ^Profile[0-9]+$ ]]; then
+            if [[ -n "${seen_profile_sections[${section}]+x}" ]]; then
+                echo -e "  ${RED}Validation error:${NC} duplicate section [${section}] (line ${section_line})"
+                ((error_count++)) || true
+            fi
+            seen_profile_sections["${section}"]=1
+            if [[ -z "${prof_name}" ]]; then
+                echo -e "  ${RED}Validation error:${NC} [${section}] missing Name= (line ${section_line})"
+                ((error_count++)) || true
+            fi
+            if [[ -z "${prof_path}" ]]; then
+                echo -e "  ${RED}Validation error:${NC} [${section}] missing Path= (line ${section_line})"
+                ((error_count++)) || true
+            else
+                if [[ -z "${prof_rel}" ]]; then
+                    echo -e "  ${YELLOW}Validation warning:${NC} [${section}] missing IsRelative= (line ${section_line}), assuming 1"
+                    ((warn_count++)) || true
+                    prof_rel="1"
+                fi
+                if [[ "${prof_rel}" != "0" && "${prof_rel}" != "1" ]]; then
+                    echo -e "  ${RED}Validation error:${NC} [${section}] IsRelative=${prof_rel} (line ${section_line})"
+                    ((error_count++)) || true
+                fi
+                if [[ "${prof_rel}" == "1" && "${prof_path}" == /* ]]; then
+                    echo -e "  ${RED}Validation error:${NC} [${section}] IsRelative=1 but Path is absolute (line ${section_line})"
+                    ((error_count++)) || true
+                fi
+                if [[ "${prof_rel}" == "0" && "${prof_path}" != /* ]]; then
+                    echo -e "  ${RED}Validation error:${NC} [${section}] IsRelative=0 but Path is not absolute (line ${section_line})"
+                    ((error_count++)) || true
+                fi
+                local full_path
+                if [[ "${prof_rel}" == "1" ]]; then
+                    full_path="${tb_dir}/${prof_path}"
+                else
+                    full_path="${prof_path}"
+                fi
+                profile_full_paths["${full_path}"]=1
+            fi
+        fi
+    }
+
+    local line_no=0
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        ((line_no++)) || true
+        line="${line%$'\r'}"
+        [[ -z "${line}" || "${line}" == \;* || "${line}" == \#* ]] && continue
+        if [[ "${line}" == \[*\] ]]; then
+            finish_profile_section
+            section="${line#\[}"
+            section="${section%\]}"
+            section_line="${line_no}"
+            prof_name=""
+            prof_path=""
+            prof_rel=""
+            prof_default=""
+            if [[ "${section}" =~ ^Install ]]; then
+                install_line="${line_no}"
+            fi
+            continue
+        fi
+
+        if [[ "${line}" != *=* ]]; then
+            echo -e "  ${RED}Validation error:${NC} malformed line ${line_no}: ${line}"
+            ((error_count++)) || true
+            continue
+        fi
+        local key="${line%%=*}"
+        local val="${line#*=}"
+
+        if [[ "${section}" =~ ^Profile[0-9]+$ ]]; then
+            case "${key}" in
+                Name) prof_name="${val}" ;;
+                Path) prof_path="${val}" ;;
+                IsRelative) prof_rel="${val}" ;;
+                Default) prof_default="${val}" ;;
+            esac
+        elif [[ "${section}" =~ ^Install ]]; then
+            if [[ "${key}" == "Default" ]]; then
+                install_default="${val}"
+            fi
+        fi
+    done < "${profiles_ini}"
+    finish_profile_section
+
+    if [[ -n "${install_default}" ]]; then
+        local install_full=""
+        if [[ "${install_default}" == /* ]]; then
+            install_full="${install_default}"
+        else
+            install_full="${tb_dir}/${install_default}"
+        fi
+        if [[ -z "${profile_full_paths[${install_full}]+x}" ]]; then
+            echo -e "  ${RED}Validation error:${NC} [Install] Default=${install_default} does not match any Profile Path (line ${install_line})"
+            ((error_count++)) || true
+        fi
+    else
+        echo -e "  ${YELLOW}Validation warning:${NC} no [Install] Default= found"
+        ((warn_count++)) || true
+    fi
+
+    if [[ ${error_count} -eq 0 && ${warn_count} -eq 0 ]]; then
+        echo -e "  ${GREEN}Validation:${NC} OK"
+    else
+        echo -e "  ${YELLOW}Validation:${NC} ${error_count} error(s), ${warn_count} warning(s)"
+    fi
+}
+
+# Audit a single Thunderbird directory
+# Usage: audit_tb_dir TYPE DIR INSTALLED MODE
+# MODE is "report" (default) or "fix"
+audit_tb_dir() {
+    local tb_type="$1"
+    local tb_dir="$2"
+    local installed="$3"
+    local mode="${4:-report}"
+
+    if [[ "${mode}" == "report" ]]; then
+        echo -e "\n${BOLD}=== ${tb_type} (${tb_dir}) ===${NC}"
+    fi
+
+    if [[ ! -d "${tb_dir}" ]]; then
+        if [[ "${mode}" == "report" ]]; then
+            if "${installed}"; then
+                echo -e "  ${YELLOW}Directory does not exist (fresh install?)${NC}"
+            else
+                echo -e "  ${BLUE}(not installed)${NC}"
+            fi
+        fi
+        return
+    fi
+
+    if [[ "${mode}" == "report" ]]; then
+        list_profile_dirs_mtime "${tb_dir}"
+    fi
+
+    local profiles_ini="${tb_dir}/profiles.ini"
+    if [[ ! -f "${profiles_ini}" ]]; then
+        if [[ "${mode}" == "report" ]]; then
+            echo -e "  ${YELLOW}No profiles.ini found${NC}"
+        fi
+        local has_orphans=false
+        local unknown_count=0
+        while IFS= read -r -d '' dir; do
+            local size
+            size=$(get_size "${dir}")
+            if [[ "${mode}" == "report" ]]; then
+                echo -e "  ${RED}[orphan]${NC}  ${dir}  ${size}"
+            elif [[ "${mode}" == "fix" ]]; then
+                prompt_remove "${dir}"
+            fi
+            has_orphans=true
+            if [[ ! -f "${dir}/prefs.js" ]]; then
+                ((unknown_count++)) || true
+            fi
+        done < <(find "${tb_dir}" -maxdepth 1 -type d -name "*.default*" -print0 2>/dev/null)
+        if ! "${has_orphans}" && [[ "${mode}" == "report" ]]; then
+            echo "  No profile directories found"
+        fi
+        if [[ "${mode}" == "report" ]]; then
+            local root_size
+            root_size=$(get_size "${tb_dir}")
+            echo -e "  Root size: ${root_size}  Profiles: 0  Unknown dirs: ${unknown_count}"
+        fi
+        return
+    fi
+
+    if [[ "${mode}" == "report" ]]; then
+        validate_profiles_ini "${profiles_ini}" "${tb_dir}"
+    fi
+
+    # Get active profile path
+    local active_profile
+    active_profile=$(get_active_profile_install "${profiles_ini}")
+    local active_source="Install"
+
+    # Build list of declared profile paths
+    declare -A declared_paths
+    declare -A profile_names
+    declare -A profile_defaults
+    declare -A profile_raw_paths
+    declare -A profile_is_relative
+    declare -A profile_seen
+    local dup_count=0
+    local abs_count=0
+
+    while IFS='|' read -r name path rel def; do
+        local full_path
+        if [[ "${rel}" == "1" ]]; then
+            full_path="${tb_dir}/${path}"
+        else
+            full_path="${path}"
+        fi
+        if [[ -n "${profile_seen[${full_path}]+x}" ]]; then
+            ((dup_count++)) || true
+        fi
+        profile_seen["${full_path}"]=1
+        declared_paths["${full_path}"]=1
+        profile_names["${full_path}"]="${name}"
+        profile_defaults["${full_path}"]="${def}"
+        profile_raw_paths["${full_path}"]="${path}"
+        profile_is_relative["${full_path}"]="${rel}"
+        if [[ "${rel}" != "1" ]]; then
+            ((abs_count++)) || true
+        fi
+    done < <(parse_profiles_ini "${profiles_ini}")
+
+    # Track what we find
+    local orphan_count=0
+    local broken_count=0
+    local profile_count=0
+
+    # Check declared profiles
+    for full_path in "${!declared_paths[@]}"; do
+        local name="${profile_names[${full_path}]}"
+        local is_default="${profile_defaults[${full_path}]}"
+        local size
+        size=$(get_size "${full_path}")
+        local dirname
+        dirname=$(basename "${full_path}")
+        local mtime
+        mtime=$(get_mtime_display "${full_path}")
+        local mail_size
+        mail_size=$(get_subdir_size "${full_path}/Mail")
+        local imap_size
+        imap_size=$(get_subdir_size "${full_path}/ImapMail")
+
+        local status=""
+        local color="${NC}"
+        local active_note=""
+
+        # Determine if this is the active profile
+        if [[ -n "${active_profile}" ]] && { [[ "${active_profile}" == "${dirname}" ]] || [[ "${active_profile}" == "${full_path}" ]]; }; then
+            status="[active]"
+            color="${GREEN}"
+            active_note="(active via ${active_source})"
+        elif [[ "${is_default}" == "1" ]]; then
+            if [[ -z "${active_profile}" ]]; then
+                status="[active]"
+                color="${GREEN}"
+                active_source="Profile Default=1"
+                active_note="(active via ${active_source})"
+            else
+                status="[default]"
+                color="${GREEN}"
+            fi
+        else
+            status="[unused]"
+            color="${YELLOW}"
+        fi
+
+        if [[ "${mode}" == "report" ]]; then
+            if [[ ! -d "${full_path}" ]]; then
+                echo -e "  ${RED}[broken]${NC}  ${name} → ${full_path} (missing directory)"
+                ((broken_count++)) || true
+            else
+                echo -e "  ${color}${status}${NC}  ${full_path}  ${size}  (${name}) ${active_note}"
+                echo -e "    mtime: ${mtime}  Mail: ${mail_size}  ImapMail: ${imap_size}"
+                if [[ "${profile_is_relative[${full_path}]}" != "1" ]]; then
+                    echo -e "    ${YELLOW}absolute path in profiles.ini${NC}"
+                fi
+            fi
+            ((profile_count++)) || true
+        elif [[ "${mode}" == "fix" ]] && [[ "${status}" != "[active]" ]] && [[ -d "${full_path}" ]]; then
+            prompt_remove_profile "${full_path}" "${profiles_ini}" "${profile_raw_paths[${full_path}]}" "${tb_dir}"
+        fi
+    done
+
+    # Find orphaned directories (exist but not in profiles.ini)
+    local unknown_count=0
+    while IFS= read -r -d '' dir; do
+        if [[ -z "${declared_paths[${dir}]+x}" ]]; then
+            local size
+            size=$(get_size "${dir}")
+
+            # Check if it looks like a real profile
+            if [[ -f "${dir}/prefs.js" ]]; then
+                if [[ "${mode}" == "report" ]]; then
+                    echo -e "  ${RED}[orphan]${NC}  ${dir}  ${size}  ← not in profiles.ini"
+                    ((orphan_count++)) || true
+                elif [[ "${mode}" == "fix" ]]; then
+                    prompt_remove "${dir}"
+                fi
+            elif [[ "${mode}" == "report" ]]; then
+                local has_compat="no"
+                local has_logins="no"
+                [[ -f "${dir}/compatibility.ini" ]] && has_compat="yes"
+                [[ -f "${dir}/logins.json" ]] && has_logins="yes"
+                echo -e "  ${YELLOW}[unknown]${NC}  ${dir}  ${size}  ← not a profile (no prefs.js)  compat:${has_compat} logins:${has_logins}"
+                ((unknown_count++)) || true
+            fi
+        fi
+    done < <(find "${tb_dir}" -maxdepth 1 -mindepth 1 -type d ! -name "Crash Reports" ! -name "Pending Pings" -print0 2>/dev/null)
+
+    # Summary for this installation
+    if [[ "${mode}" == "report" ]] && [[ ${orphan_count} -gt 0 ]]; then
+        echo -e "\n  ${YELLOW}Found ${orphan_count} orphaned profile(s)${NC}"
+        if ! "${fix_mode}"; then
+            echo -e "  Run with ${BOLD}--fix${NC} to interactively remove them"
+        fi
+    fi
+    if [[ "${mode}" == "report" ]]; then
+        local root_size
+        root_size=$(get_size "${tb_dir}")
+        echo -e "  Root size: ${root_size}  Profiles: ${profile_count}  Broken: ${broken_count}  Orphans: ${orphan_count}  Unknown dirs: ${unknown_count}"
+        if [[ ${abs_count} -gt 0 ]]; then
+            echo -e "  ${YELLOW}Absolute paths in profiles.ini: ${abs_count}${NC}"
+        fi
+        if [[ ${dup_count} -gt 0 ]]; then
+            echo -e "  ${YELLOW}Duplicate Path entries in profiles.ini: ${dup_count}${NC}"
+        fi
+    fi
+}
+
+changes_made=false
+
+prompt_remove() {
+    local dir="$1"
+
+    echo
+    read -rp "  Remove orphaned profile '${dir}'? [y/N] " confirm < /dev/tty
+    if [[ "${confirm}" == [yY] ]]; then
+        local size
+        size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
+        rm -rf "${dir}"
+        echo -e "  ${GREEN}Removed${NC} ${dir} (freed ${size})"
+        changes_made=true
+    else
+        echo "  Skipped"
+    fi
+}
+
+remove_from_profiles_ini() {
+    local profiles_ini="$1"
+    local path_value="$2"
+
+    awk -v path="Path=${path_value}" '
+        /^\[Profile[0-9]+\]/ {
+            if (buf != "" && !skip) printf "%s", buf
+            skip=0; buf=$0 ORS; next
+        }
+        /^\[/ {
+            if (buf != "" && !skip) printf "%s", buf
+            skip=0; buf=""
+            print; next
+        }
+        buf != "" {
+            if ($0 == path) skip=1
+            buf = buf $0 ORS
+            next
+        }
+        { print }
+        END { if (buf != "" && !skip) printf "%s", buf }
+    ' "${profiles_ini}" > "${profiles_ini}.tmp" && mv "${profiles_ini}.tmp" "${profiles_ini}"
+}
+
+prompt_remove_profile() {
+    local dir="$1"
+    local profiles_ini="$2"
+    local raw_path="$3"
+    local tb_dir="$4"
+
+    echo
+    if [[ -n "${tb_dir}" ]] && [[ "${dir}" != "${tb_dir}"/* ]]; then
+        echo "  Warning: profile is outside ${tb_dir}"
+        read -rp "  Remove outside-root profile '${dir}'? [y/N] " confirm_outside < /dev/tty
+        if [[ "${confirm_outside}" != [yY] ]]; then
+            echo "  Skipped"
+            return
+        fi
+    fi
+    read -rp "  Remove inactive profile '${dir}'? [y/N] " confirm < /dev/tty
+    if [[ "${confirm}" == [yY] ]]; then
+        local size
+        size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
+        rm -rf "${dir}"
+        remove_from_profiles_ini "${profiles_ini}" "${raw_path}"
+        echo -e "  ${GREEN}Removed${NC} ${dir} (freed ${size})"
+        echo -e "  ${GREEN}Removed entry from profiles.ini${NC}"
+        changes_made=true
+    else
+        echo "  Skipped"
+    fi
+}
+
+# Main
+run_audit() {
+    local mode="$1"
+    for tb_type in System Flatpak Snap; do
+        local tb_dir="${tb_dirs[${tb_type}]}"
+        local installed=false
+        if is_installed "${tb_type}"; then
+            installed=true
+        fi
+        audit_tb_dir "${tb_type}" "${tb_dir}" "${installed}" "${mode}"
+    done
+}
+
+echo -e "${BOLD}Thunderbird Profile Audit${NC}"
+echo "========================="
+run_audit report
+
+if "${fix_mode}"; then
+    echo
+    run_audit fix
+    if "${changes_made}"; then
+        echo
+        echo -e "${BOLD}Post-fix Report${NC}"
+        echo "========================="
+        run_audit report
+    fi
+fi
+
+echo
+echo -e "${BOLD}Legend:${NC}"
+echo -e "  ${GREEN}[active]${NC}   Currently active profile"
+echo -e "  ${GREEN}[default]${NC}  Marked as default in profiles.ini"
+echo -e "  ${YELLOW}[unused]${NC}   In profiles.ini but not active"
+echo -e "  ${RED}[orphan]${NC}   Directory exists but not in profiles.ini"
+echo -e "  ${RED}[broken]${NC}   In profiles.ini but directory missing"
+echo -e "  ${YELLOW}[unknown]${NC}  Directory without prefs.js"

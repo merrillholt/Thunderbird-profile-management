@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_file="${HOME}/thunderbird-restore.log"
+dry_run=false
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--dry-run]
+
+Options:
+  --dry-run   Show what would be restored without making changes
+  -h, --help  Show this help
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        --dry-run) dry_run=true ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "Error: Unknown option: ${arg}" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+pcloud_mount="/mnt/pcloud"
+pcloud_drive="${HOME}/pCloudDrive"
+backup_root_rel="Thunderbird Backup"
+
+# Locate backup source — check local sync first, then virtual drive
+if [[ -d "${pcloud_mount}" ]]; then
+    if ! mountpoint -q "${pcloud_mount}"; then
+        echo "Error: ${pcloud_mount} exists but is not mounted." >&2
+        exit 1
+    fi
+    src="${pcloud_mount}/${backup_root_rel}/thunderbird/"
+elif [[ -d "${pcloud_drive}" ]]; then
+    src="${pcloud_drive}/${backup_root_rel}/thunderbird/"
+else
+    echo "Error: No Thunderbird backup found in pCloud" >&2
+    exit 1
+fi
+
+# Detect Thunderbird installation and set profile directory accordingly
+if command -v flatpak &>/dev/null && flatpak info org.mozilla.Thunderbird &>/dev/null; then
+    tb_type="Flatpak"
+    tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+elif snap list thunderbird &>/dev/null; then
+    tb_type="Snap"
+    tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
+elif command -v thunderbird &>/dev/null; then
+    tb_type="System"
+    tb_dir="${HOME}/.thunderbird"
+else
+    echo "Error: No Thunderbird installation found" >&2
+    exit 1
+fi
+
+profiles_ini="${tb_dir}/profiles.ini"
+
+if [[ ! -f "${profiles_ini}" ]]; then
+    echo "Error: ${profiles_ini} not found" >&2
+    echo "Please launch Thunderbird once to create a default profile, then re-run this script." >&2
+    exit 1
+fi
+
+# Determine the active profile from the locked Install section in profiles.ini,
+# fallback to the profile marked Default=1.
+active_profile=$(awk -F= '/^\[Install/{found=1} found && /^Default=/{print $2; exit}' "${profiles_ini}")
+
+if [[ -n "${active_profile}" ]]; then
+    if [[ "${active_profile}" = /* ]]; then
+        profile_path="${active_profile}"
+    else
+        profile_path="${tb_dir}/${active_profile}"
+    fi
+else
+    profile_info=$(awk -F= '
+        /^\[Profile/ {
+            if (in_profile && is_default && path != "") {print path "|" rel; exit}
+            in_profile=1; is_default=0; path=""; rel=""
+        }
+        /^\[/ && $0 !~ /^\[Profile/ {in_profile=0}
+        in_profile && /^Default=1/ {is_default=1}
+        in_profile && /^Path=/ {path=$2}
+        in_profile && /^IsRelative=/ {rel=$2}
+        END {
+            if (is_default && path != "") {print path "|" rel}
+        }
+    ' "${profiles_ini}")
+
+    profile_rel="${profile_info##*|}"
+    profile_path_raw="${profile_info%%|*}"
+
+    if [[ -z "${profile_path_raw}" ]]; then
+        echo "Error: Could not determine active Thunderbird profile from ${profiles_ini}" >&2
+        exit 1
+    fi
+
+    if [[ "${profile_rel}" = "1" ]]; then
+        profile_path="${tb_dir}/${profile_path_raw}"
+    else
+        profile_path="${profile_path_raw}"
+    fi
+fi
+
+dest="${profile_path}/"
+mkdir -p "${dest}"
+
+check_thunderbird_running() {
+    pgrep -x thunderbird &>/dev/null || flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird
+}
+
+if ! "${dry_run}" && check_thunderbird_running; then
+    echo "Thunderbird is running."
+    read -rp "Kill Thunderbird before restoring? [y/N] " confirm_kill
+    if [[ "${confirm_kill}" != [yY] ]]; then
+        echo "Error: Please close Thunderbird before restoring." >&2
+        exit 1
+    fi
+    pkill -x thunderbird 2>/dev/null || true
+    flatpak kill org.mozilla.Thunderbird 2>/dev/null || true
+    sleep 2
+    if check_thunderbird_running; then
+        echo "Error: Thunderbird is still running. Please close it manually and retry." >&2
+        exit 1
+    fi
+fi
+
+# Show restore plan and confirm
+echo "Thunderbird: ${tb_type}"
+echo "Active profile: ${active_profile}"
+if "${dry_run}"; then
+    echo "Dry run: ${src} -> ${dest}"
+else
+    echo "Restoring from ${src} to ${dest}"
+fi
+echo
+if ! "${dry_run}"; then
+    read -rp "This will overwrite the current profile. Continue? [y/N] " confirm
+    if [[ "${confirm}" != [yY] ]]; then
+        echo "Restore cancelled."
+        exit 0
+    fi
+fi
+
+if [[ ! -f "${src}/prefs.js" ]]; then
+    echo "Error: Source does not look like a Thunderbird profile: ${src}" >&2
+    exit 1
+fi
+
+manifest_file="${src}/.backup_manifest"
+if [[ ! -f "${manifest_file}" ]]; then
+    if ! "${dry_run}"; then
+        echo "Warning: Backup manifest not found: ${manifest_file}" >&2
+        read -rp "Continue anyway? [y/N] " confirm_manifest
+        if [[ "${confirm_manifest}" != [yY] ]]; then
+            echo "Restore cancelled."
+            exit 0
+        fi
+    fi
+else
+    manifest_file_count=$(awk -F= '/^file_count=/{print $2}' "${manifest_file}")
+    if [[ -z "${manifest_file_count}" || "${manifest_file_count}" -le 0 ]]; then
+        echo "Error: Backup manifest appears invalid: ${manifest_file}" >&2
+        exit 1
+    fi
+fi
+
+resolved_dest=$(readlink -f "${dest}")
+resolved_tb_dir=$(readlink -f "${tb_dir}")
+if [[ "${resolved_dest}" != "${resolved_tb_dir}"/* ]]; then
+    echo "Error: Refusing to restore outside Thunderbird profile directory: ${dest}" >&2
+    exit 1
+fi
+
+echo
+start_time=$(date +%s)
+if "${dry_run}"; then
+    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='parent.lock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${dest}")
+else
+    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='parent.lock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
+fi
+end_time=$(date +%s)
+elapsed=$(( end_time - start_time ))
+
+# Format duration
+if (( elapsed >= 3600 )); then
+    duration="$(( elapsed / 3600 ))h $(( (elapsed % 3600) / 60 ))m $(( elapsed % 60 ))s"
+elif (( elapsed >= 60 )); then
+    duration="$(( elapsed / 60 ))m $(( elapsed % 60 ))s"
+else
+    duration="${elapsed}s"
+fi
+
+# Parse rsync stats
+files_transferred=$(echo "${rsync_output}" | awk '/Number of regular files transferred:/{print $NF}')
+total_size=$(echo "${rsync_output}" | awk '/Total file size:/{print $4, $5}')
+sent=$(echo "${rsync_output}" | awk '/Total bytes sent:/{if ($5!="") print $4" "$5; else print $4}')
+restored_size=$(du -sh "${dest}" | cut -f1)
+profile_size=$(du -sh "${src}" | cut -f1)
+file_count=$(find "${dest}" -type f | wc -l)
+
+# Report
+report=$(cat <<EOF
+==============================
+  Restore Report
+==============================
+  Date:               $(date '+%Y-%m-%d %H:%M:%S')
+  Thunderbird:        ${tb_type}
+  Profile:            ${active_profile}
+  Source:             ${src}
+  Destination:        ${dest}
+  Duration:           ${duration}
+  Files transferred:  ${files_transferred}
+  Data transferred:   ${sent}
+  Total files:        ${file_count}
+  Restored size:      ${restored_size}${dry_run:+ (current profile)}
+  Profile size:       ${profile_size}
+==============================
+  Restore ${dry_run:+(dry run) }complete.
+==============================
+EOF
+)
+
+echo "${report}"
+echo "${report}" >> "${log_file}"
