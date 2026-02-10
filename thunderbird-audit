@@ -145,6 +145,61 @@ get_active_profile_install() {
     awk -F= '/^\[Install/{found=1} found && /^Default=/{print $2; exit}' "${profiles_ini}"
 }
 
+ensure_profile_default_flag() {
+    local profiles_ini="$1"
+    [[ -f "${profiles_ini}" ]] || return
+
+    if awk '
+        /^\[Profile[0-9]+\]/ { in_profile=1; next }
+        /^\[/ { in_profile=0; next }
+        in_profile && /^Default=1$/ { found=1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "${profiles_ini}"; then
+        return
+    fi
+
+    awk '
+        BEGIN { in_profile=0; first_profile=0; saw_default=0; inserted=0; seen_any_profile=0 }
+        /^\[Profile[0-9]+\]/ {
+            if (in_profile && first_profile && !saw_default && !inserted) {
+                print "Default=1"
+                inserted=1
+            }
+            in_profile=1
+            if (!seen_any_profile) {
+                first_profile=1
+                seen_any_profile=1
+            } else {
+                first_profile=0
+            }
+            saw_default=0
+            print
+            next
+        }
+        /^\[/ {
+            if (in_profile && first_profile && !saw_default && !inserted) {
+                print "Default=1"
+                inserted=1
+            }
+            in_profile=0
+            first_profile=0
+            print
+            next
+        }
+        {
+            if (in_profile && $0 == "Default=1") {
+                saw_default=1
+            }
+            print
+        }
+        END {
+            if (in_profile && first_profile && !saw_default && !inserted) {
+                print "Default=1"
+            }
+        }
+    ' "${profiles_ini}" > "${profiles_ini}.tmp" && mv "${profiles_ini}.tmp" "${profiles_ini}"
+}
+
 # Strict validation for profiles.ini
 validate_profiles_ini() {
     local profiles_ini="$1"
@@ -544,6 +599,7 @@ prompt_remove_profile() {
         size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
         rm -rf "${dir}"
         remove_from_profiles_ini "${profiles_ini}" "${raw_path}"
+        ensure_profile_default_flag "${profiles_ini}"
         echo -e "  ${GREEN}Removed${NC} ${dir} (freed ${size})"
         echo -e "  ${GREEN}Removed entry from profiles.ini${NC}"
         changes_made=true
