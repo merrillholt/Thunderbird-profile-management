@@ -192,6 +192,12 @@ EOF
 fi
 
 # Report
+if "${dry_run}"; then
+    mode_suffix="(dry run) "
+else
+    mode_suffix=""
+fi
+
 report=$(cat <<EOF
 ==============================
   Backup Report
@@ -208,7 +214,7 @@ report=$(cat <<EOF
   Total backup size:  ${backup_size}
   Profile size:       ${profile_size}
 ==============================
-  Backup ${dry_run:+(dry run) }complete.
+  Backup ${mode_suffix}complete.
 ==============================
 EOF
 )
