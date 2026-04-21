@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "name": "Thunderbird Review Actions",
+  "version": "0.3.1",
+  "description": "Approve senders from the Review folder by adding them to the Whitelist address book, or tag messages for later trash cleanup.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "thunderbird-review-actions@merrill.local",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": [
+    "accountsRead",
+    "addressBooks",
+    "messagesDelete",
+    "messagesRead",
+    "messagesUpdate"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "message_display_action": {
+    "default_title": "Review Actions",
+    "default_popup": "popup.html"
+  }
+}

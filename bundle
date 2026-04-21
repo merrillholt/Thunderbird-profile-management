@@ -1,0 +1,1 @@
+cd ~/thunderbird-review-actions && zip -j thunderbird-review-actions.xpi manifest.json background.js popup.html popup.js

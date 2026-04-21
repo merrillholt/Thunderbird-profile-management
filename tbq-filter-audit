@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""Read-only Thunderbird filter auditor.
+
+Parses Thunderbird msgFilterRules.dat files and evaluates them against messages
+in a Thunderbird mbox folder, such as Local Folders/Review.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mailbox
+import re
+import sqlite3
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.header import decode_header, make_header
+from email.utils import getaddresses, parsedate_to_datetime
+from pathlib import Path
+from typing import Iterable
+
+
+DEFAULT_PROFILE = Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird/bqmdw26k.default-default"
+DEFAULT_RULES = {
+    "gmail": DEFAULT_PROFILE / "ImapMail/imap.gmail.com/msgFilterRules.dat",
+    "bluerug": DEFAULT_PROFILE / "ImapMail/mail.bluerug.org/msgFilterRules.dat",
+    "comcast": DEFAULT_PROFILE / "ImapMail/imap.comcast.net/msgFilterRules.dat",
+}
+DEFAULT_FOLDER = DEFAULT_PROFILE / "Mail/Local Folders/Review"
+
+
+@dataclass
+class Rule:
+    name: str = ""
+    enabled: bool = True
+    type: str = ""
+    condition: str = ""
+    actions: list[tuple[str, str | None]] = field(default_factory=list)
+
+
+@dataclass
+class EvalResult:
+    matched: bool
+    notes: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EvalContext:
+    books: "AddressBooks"
+    cardbook: "CardBookStore"
+    preserve_tags: bool = False
+
+
+class AddressBooks:
+    def __init__(self, profile: Path):
+        self.profile = profile
+        self._cache: dict[str, set[str]] = {}
+
+    def emails_for_uri(self, uri: str) -> set[str]:
+        if uri in self._cache:
+            return self._cache[uri]
+
+        prefix = "jsaddrbook://"
+        if not uri.startswith(prefix):
+            self._cache[uri] = set()
+            return set()
+
+        name = uri.removeprefix(prefix)
+        path = self.profile / name
+        emails: set[str] = set()
+
+        if path.exists():
+            try:
+                con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+                rows = con.execute(
+                    "select value from properties where name in ('PrimaryEmail', 'SecondEmail', '_vCard')"
+                )
+                for (value,) in rows:
+                    emails.update(extract_emails(str(value)))
+                con.close()
+            except sqlite3.Error as exc:
+                print(f"warning: could not read address book {path}: {exc}", file=sys.stderr)
+
+        self._cache[uri] = emails
+        return emails
+
+
+@dataclass
+class CardBookContact:
+    dir_pref_id: str
+    text: str
+
+
+class CardBookStore:
+    def __init__(self, profile: Path):
+        self.profile = profile
+        self._contacts: list[CardBookContact] | None = None
+        self._load_error: str | None = None
+
+    def matches_from(self, msg: mailbox.mboxMessage, target: str) -> tuple[bool, str]:
+        contacts = self.contacts()
+        if self._load_error:
+            return False, self._load_error
+
+        dir_pref_id, category = self.parse_target(target)
+        sender = message_from_text(msg)
+        candidates = [
+            contact
+            for contact in contacts
+            if (dir_pref_id is None or contact.dir_pref_id == dir_pref_id)
+            and (category is None or category_matches(contact.text, category))
+        ]
+        for contact in candidates:
+            if sender_matches_cardbook_contact(msg, contact.text):
+                scope = "any CardBook address book" if dir_pref_id is None else dir_pref_id
+                if category:
+                    scope = f"{scope}::{category}"
+                return True, f"{sender!r} matched CardBook {scope}"
+
+        scope = "all CardBook address books" if dir_pref_id is None else dir_pref_id
+        if category:
+            scope = f"{scope}::{category}"
+        return False, f"{sender!r} not found in CardBook {scope}"
+
+    def contacts(self) -> list[CardBookContact]:
+        if self._contacts is not None:
+            return self._contacts
+
+        self._contacts = []
+        db_path = self.find_cardbook_cards_db()
+        if db_path is None:
+            self._load_error = "CardBook CardBookCard IndexedDB database not found"
+            return self._contacts
+
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+            store_row = con.execute("select id from object_store where name = 'cards'").fetchone()
+            if store_row is None:
+                self._load_error = f"CardBook cards object store not found in {db_path}"
+                return self._contacts
+            rows = con.execute("select data from object_data where object_store_id = ?", (store_row[0],))
+            for (data,) in rows:
+                text = bytes(data).decode("latin1", "ignore")
+                dir_pref_id = extract_cardbook_dir_pref_id(text)
+                if dir_pref_id:
+                    self._contacts.append(CardBookContact(dir_pref_id=dir_pref_id, text=text.lower()))
+            con.close()
+        except sqlite3.Error as exc:
+            self._load_error = f"could not read CardBook database {db_path}: {exc}"
+
+        return self._contacts
+
+    def find_cardbook_cards_db(self) -> Path | None:
+        for db_path in self.cardbook_idb_paths():
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+                row = con.execute("select name from database").fetchone()
+                con.close()
+            except sqlite3.Error:
+                continue
+            if row and row[0] == "CardBookCard":
+                return db_path
+        return None
+
+    def cardbook_idb_paths(self) -> list[Path]:
+        uuids = self.cardbook_extension_uuids()
+        paths: list[Path] = []
+        for uuid in uuids:
+            roots = [
+                self.profile / f"storage/default/moz-extension+++{uuid}/idb",
+                self.profile / f"storage/default/moz-extension+++{uuid}^userContextId=4294967295/idb",
+            ]
+            for root in roots:
+                if root.exists():
+                    paths.extend(sorted(root.glob("*.sqlite")))
+        return paths
+
+    def cardbook_extension_uuids(self) -> list[str]:
+        prefs = self.profile / "prefs.js"
+        if not prefs.exists():
+            return []
+        match = re.search(
+            r'user_pref\("extensions\.webextensions\.uuids",\s*"(.+)"\);',
+            prefs.read_text(errors="replace"),
+        )
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(1).encode("utf-8").decode("unicode_escape"))
+        except json.JSONDecodeError:
+            return []
+        uuid = data.get("cardbook@vigneau.philippe")
+        return [uuid] if uuid else []
+
+    @staticmethod
+    def parse_target(target: str) -> tuple[str | None, str | None]:
+        if target == "allAddressBooks":
+            return None, None
+        if "::" in target:
+            dir_pref_id, category = target.split("::", 1)
+            return dir_pref_id, category
+        return target, None
+
+
+def decode_mime(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def extract_emails(value: str) -> set[str]:
+    return {addr.lower() for _, addr in getaddresses([value]) if addr}
+
+
+def message_from_text(msg: mailbox.mboxMessage) -> str:
+    return decode_mime(msg.get("from", ""))
+
+
+def message_from_emails(msg: mailbox.mboxMessage) -> set[str]:
+    return extract_emails(message_from_text(msg))
+
+
+def message_from_names(msg: mailbox.mboxMessage) -> list[str]:
+    return [decode_mime(name) for name, _ in getaddresses([message_from_text(msg)]) if name]
+
+
+def header_text(msg: mailbox.mboxMessage, field: str) -> str:
+    values = msg.get_all(field, [])
+    return "\n".join(decode_mime(v) for v in values)
+
+
+def message_tags(msg: mailbox.mboxMessage, preserve: bool = False) -> set[str]:
+    keys = msg.get("x-mozilla-keys", "") or ""
+    tags = {key for key in keys.split() if key}
+    if preserve:
+        return tags
+    return {
+        tag
+        for tag in tags
+        if tag not in {"tbq_identified"} and not tag.endswith("_processed")
+    }
+
+
+def extract_cardbook_dir_pref_id(text: str) -> str | None:
+    match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", text, re.I)
+    return match.group(0) if match else None
+
+
+def category_matches(contact_text: str, category: str) -> bool:
+    normalized = category.lower()
+    variants = {normalized}
+    if normalized.endswith("s"):
+        variants.add(normalized[:-1])
+    return any(variant in contact_text for variant in variants)
+
+
+def sender_matches_cardbook_contact(msg: mailbox.mboxMessage, contact_text: str) -> bool:
+    for email in message_from_emails(msg):
+        if email in contact_text:
+            return True
+        local = email.split("@", 1)[0]
+        local_parts = [part for part in re.split(r"[^a-z0-9]+", local.lower()) if len(part) >= 3]
+        if local_parts and all(part in contact_text for part in local_parts):
+            return True
+
+    for name in message_from_names(msg):
+        tokens = [token.lower() for token in re.findall(r"[A-Za-z0-9]+", name) if len(token) >= 3]
+        if tokens and all(token in contact_text for token in tokens):
+            return True
+
+    return False
+
+
+def parse_filters(path: Path) -> list[Rule]:
+    rules: list[Rule] = []
+    current: Rule | None = None
+    pending_action: str | None = None
+
+    for raw in path.read_text(errors="replace").splitlines():
+        if not raw or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        value = unquote(value.strip())
+
+        if key == "name":
+            if current is not None:
+                rules.append(current)
+            current = Rule(name=value)
+            pending_action = None
+        elif current is None:
+            continue
+        elif key == "enabled":
+            current.enabled = value.lower() == "yes"
+        elif key == "type":
+            current.type = value
+        elif key == "condition":
+            current.condition = value
+        elif key == "action":
+            current.actions.append((value, None))
+            pending_action = value
+        elif key == "actionValue" and pending_action is not None:
+            action, _ = current.actions[-1]
+            current.actions[-1] = (action, value)
+            pending_action = None
+
+    if current is not None:
+        rules.append(current)
+    return rules
+
+
+def unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def split_top_level_commas(text: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def matching_paren(text: str, start: int) -> int:
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    raise ValueError("unbalanced condition")
+
+
+def pop_word(text: str) -> tuple[str, str]:
+    match = re.match(r"\s*([A-Za-z]+)\b(.*)", text, re.S)
+    if not match:
+        return "", text
+    return match.group(1), match.group(2)
+
+
+def parse_condition(text: str):
+    text = text.strip()
+    word, rest = pop_word(text)
+    upper = word.upper()
+    if upper in {"AND", "OR"}:
+        return (upper, parse_terms(rest, skip_word=upper))
+
+    terms = parse_terms(text, skip_word=None)
+    if len(terms) == 1:
+        return terms[0]
+    return ("AND", terms)
+
+
+def parse_terms(text: str, skip_word: str | None) -> list:
+    terms: list = []
+    pending_op: str | None = None
+    i = 0
+    while i < len(text):
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text):
+            break
+
+        word_match = re.match(r"(AND|OR)\b", text[i:], re.I)
+        if word_match:
+            word = word_match.group(1).upper()
+            i += len(word_match.group(0))
+            if skip_word and word == skip_word:
+                continue
+            pending_op = word
+            continue
+
+        if text[i] != "(":
+            raise ValueError(f"expected '(' near {text[i:i+30]!r}")
+
+        end = matching_paren(text, i)
+        inner = text[i + 1 : end].strip()
+        parts = split_top_level_commas(inner)
+        if len(parts) == 3 and not parts[0].upper() in {"AND", "OR"}:
+            term = ("ATOM", parts[0], parts[1], parts[2])
+        else:
+            term = parse_condition(inner)
+
+        if pending_op and terms:
+            left = terms.pop()
+            term = (pending_op, [left, term])
+            pending_op = None
+        terms.append(term)
+        i = end + 1
+    return terms
+
+
+def eval_node(node, msg: mailbox.mboxMessage, context: EvalContext) -> EvalResult:
+    kind = node[0]
+    if kind == "AND":
+        notes: list[str] = []
+        failures: list[str] = []
+        for child in node[1]:
+            result = eval_node(child, msg, context)
+            notes.extend(result.notes)
+            failures.extend(result.failures)
+            if not result.matched:
+                return EvalResult(False, notes, failures)
+        return EvalResult(True, notes, failures)
+    if kind == "OR":
+        notes: list[str] = []
+        failures: list[str] = []
+        for child in node[1]:
+            result = eval_node(child, msg, context)
+            notes.extend(result.notes)
+            if result.matched:
+                return EvalResult(True, notes)
+            failures.extend(result.failures)
+        return EvalResult(False, notes, [f"none of OR matched: {'; '.join(failures)}"] if failures else [])
+    if kind == "ATOM":
+        return eval_atom(node[1], node[2], node[3], msg, context)
+    raise ValueError(f"unknown node kind {kind}")
+
+
+def eval_atom(field_name: str, op: str, value: str, msg: mailbox.mboxMessage, context: EvalContext) -> EvalResult:
+    field = field_name.lower()
+    op_l = op.lower()
+    value_l = value.lower()
+
+    if field.startswith("cardbook#"):
+        text = format_atom(field_name, op, value)
+        if field == "cardbook#searchfrom" and op_l == "is in ab":
+            matched, detail = context.cardbook.matches_from(msg, value)
+            return atom_result(matched, field_name, op, value, detail)
+        return EvalResult(False, [f"unsupported CardBook condition: {text}"], [f"{text} unsupported"])
+
+    if field == "from":
+        if op_l == "contains":
+            matched = value_l in message_from_text(msg).lower()
+            return atom_result(matched, field_name, op, value, f"from is {message_from_text(msg)!r}")
+        if op_l == "is in ab":
+            allowed = context.books.emails_for_uri(value)
+            matched = bool(message_from_emails(msg) & allowed)
+            actual = ", ".join(sorted(message_from_emails(msg))) or "(none)"
+            return atom_result(matched, field_name, op, value, f"from email is {actual}")
+
+    if field == "tag":
+        tags = message_tags(msg, preserve=context.preserve_tags)
+        if op_l == "is":
+            return atom_result(value in tags, field_name, op, value, f"tags are {format_set(tags)}")
+        if op_l == "isn't":
+            return atom_result(value not in tags, field_name, op, value, f"tags are {format_set(tags)}")
+
+    if field == "age in days":
+        age = message_age_days(msg)
+        if age is None:
+            return EvalResult(False, ["message date unavailable for age check"], [f"{format_atom(field_name, op, value)} failed: no message date"])
+        try:
+            threshold = int(value)
+        except ValueError:
+            return EvalResult(False, [f"invalid age threshold: {value}"], [f"{format_atom(field_name, op, value)} failed: invalid age threshold"])
+        if op_l == "is greater than":
+            return atom_result(age > threshold, field_name, op, value, f"age is {age} days")
+
+    text = header_text(msg, field_name)
+    if op_l == "contains":
+        return atom_result(value_l in text.lower(), field_name, op, value, header_detail(field_name, text))
+    if op_l == "doesn't contain":
+        return atom_result(value_l not in text.lower(), field_name, op, value, header_detail(field_name, text))
+
+    text = format_atom(field_name, op, value)
+    return EvalResult(False, [f"unsupported condition: {text}"], [f"{text} unsupported"])
+
+
+def atom_result(matched: bool, field_name: str, op: str, value: str, detail: str) -> EvalResult:
+    if matched:
+        return EvalResult(True)
+    return EvalResult(False, failures=[f"{format_atom(field_name, op, value)} failed: {detail}"])
+
+
+def format_atom(field_name: str, op: str, value: str) -> str:
+    return f"({field_name},{op},{value})"
+
+
+def format_set(values: set[str]) -> str:
+    return ", ".join(sorted(values)) if values else "(none)"
+
+
+def header_detail(field_name: str, text: str) -> str:
+    if text:
+        snippet = " ".join(text.split())
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "..."
+        return f"{field_name} is {snippet!r}"
+    return f"{field_name} header is absent"
+
+
+def message_age_days(msg: mailbox.mboxMessage) -> int | None:
+    date = msg.get("date")
+    if not date:
+        return None
+    try:
+        parsed = parsedate_to_datetime(date)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).days
+
+
+def first_match(rules: Iterable[Rule], msg: mailbox.mboxMessage, context: EvalContext):
+    notes: list[str] = []
+    failures_by_rule: list[tuple[str, list[str]]] = []
+    for rule in rules:
+        if not rule.enabled:
+            continue
+        try:
+            node = parse_condition(rule.condition)
+            result = eval_node(node, msg, context)
+        except Exception as exc:
+            notes.append(f"{rule.name}: parse/eval error: {exc}")
+            failures_by_rule.append((rule.name, [f"parse/eval error: {exc}"]))
+            continue
+        notes.extend(f"{rule.name}: {note}" for note in result.notes)
+        if result.matched:
+            return rule, notes, failures_by_rule
+        failures_by_rule.append((rule.name, result.failures or ["condition did not match"]))
+    return None, notes, failures_by_rule
+
+
+def format_actions(rule: Rule) -> str:
+    chunks = []
+    for action, value in rule.actions:
+        chunks.append(f"{action}={value}" if value is not None else action)
+    return "; ".join(chunks)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Read-only Thunderbird filter rule audit.")
+    parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
+    parser.add_argument("--folder", type=Path, default=DEFAULT_FOLDER, help="Thunderbird mbox folder to scan")
+    parser.add_argument("--rules", type=Path, action="append", help="Specific msgFilterRules.dat file; may be repeated")
+    parser.add_argument("--account", choices=sorted(DEFAULT_RULES), action="append", help="Use a known account's rules")
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--search", help="Only inspect messages whose from/subject contains this text")
+    parser.add_argument("--show-notes", action="store_true", help="Show unsupported-condition notes")
+    parser.add_argument("--why", action="store_true", help="Show failed rules and the condition that blocked them")
+    parser.add_argument(
+        "--preserve-tags",
+        action="store_true",
+        help="Evaluate tag conditions using existing Thunderbird tags. By default, generated tbq/processed tags are ignored.",
+    )
+    args = parser.parse_args()
+
+    rule_files: list[tuple[str, Path]] = []
+    if args.rules:
+        rule_files.extend((path.parent.name, path) for path in args.rules)
+    elif args.account:
+        rule_files.extend((name, DEFAULT_RULES[name]) for name in args.account)
+    else:
+        rule_files.extend((name, path) for name, path in DEFAULT_RULES.items())
+
+    context = EvalContext(
+        books=AddressBooks(args.profile),
+        cardbook=CardBookStore(args.profile),
+        preserve_tags=args.preserve_tags,
+    )
+    parsed_rules = [(name, parse_filters(path)) for name, path in rule_files if path.exists()]
+    if not parsed_rules:
+        print("No rule files found.", file=sys.stderr)
+        return 2
+
+    mbox = mailbox.mbox(args.folder, create=False)
+    search = args.search.lower() if args.search else None
+    shown = 0
+
+    for key, msg in mbox.items():
+        subject = decode_mime(msg.get("subject", ""))
+        sender = message_from_text(msg)
+        if search and search not in f"{sender}\n{subject}".lower():
+            continue
+
+        print(f"Message {key}: {sender}")
+        print(f"  Subject: {subject}")
+        display_tags = message_tags(msg, preserve=True)
+        print(f"  Tags: {', '.join(sorted(display_tags)) or '(none)'}")
+        for account, rules in parsed_rules:
+            rule, notes, failures_by_rule = first_match(rules, msg, context)
+            if rule:
+                print(f"  {account}: {rule.name}")
+                print(f"    actions: {format_actions(rule)}")
+            else:
+                print(f"  {account}: no enabled rule matched")
+            if args.why:
+                for failed_rule, failures in failures_by_rule:
+                    print(f"    why {failed_rule}:")
+                    for failure in failures:
+                        print(f"      - {failure}")
+            if args.show_notes:
+                for note in notes:
+                    print(f"    note: {note}")
+        print()
+
+        shown += 1
+        if args.limit and shown >= args.limit:
+            break
+
+    if shown == 0:
+        print("No matching messages found.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

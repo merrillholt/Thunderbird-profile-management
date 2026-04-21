@@ -1,0 +1,19 @@
+Thunderbird filter processing.
+
+1. Repeated runs of the filters do not change previous processing of messages. If a message has been moved or copied in a previous filter run that action is not changed by the new run of filters.
+
+2. Items which are identified as not important such as newsletters are tagged as trash and are deleted after 30 days. These items should stay in the inbox until deletion. These are not copied to review.
+
+3. Important emails are identified specifically and copied to a specific local folder and remain in the inbox. These are not copied to review.
+
+4. The whitelist and cardbook determine which emails remain in the inbox and not tagged as trash. These are not copied to review.
+
+5. Some emails are identified as junk and are tagged as junk by the junk filter in the inbox. No action is taken and the junk filter tagged message is left in the inbox. If a message is manually tagged as junk in the inbox it is immediately deleted. 
+
+6. The custom review actions which are executed while in the review local folder are:
+
+	1. mark as trash - this action sets the trash after 30 days on the message in the inbox and deletes the message from the action folder. The sender is added to the trash after 30 days list so that in future runs it will be set to trash after 30 days and will not be moved to the review local folder.
+	
+	2. mark as junk - If a message is identified as junk by the custom review actions in the review folder it is marked as junk and deleted from both the review folder and the inbox.
+	
+	3. approve sender - this adds the sender to the whitelist and deletes the message from the review folder.

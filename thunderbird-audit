@@ -6,6 +6,7 @@ set -euo pipefail
 
 show_sizes=true
 fix_mode=false
+remove_types=()
 
 usage() {
     cat <<EOF
@@ -15,9 +16,11 @@ Audit Thunderbird profiles across all installation types (system, flatpak, snap)
 Identifies orphaned directories, broken references, and disk usage.
 
 Options:
-  --no-sizes   Skip calculating directory sizes (faster)
-  --fix        Interactive mode to remove orphaned/unused directories
-  -h, --help   Show this help
+  --no-sizes        Skip calculating directory sizes (faster)
+  --fix             Interactive mode to remove orphaned/unused directories
+  --remove=TYPE     Remove ALL data for TYPE (System, Flatpak, Snap), including
+                    orphaned data. Can be specified multiple times.
+  -h, --help        Show this help
 EOF
 }
 
@@ -25,6 +28,9 @@ for arg in "$@"; do
     case "${arg}" in
         --no-sizes) show_sizes=false ;;
         --fix) fix_mode=true ;;
+        --remove=*)
+            remove_types+=("${arg#--remove=}")
+            ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "Error: Unknown option: ${arg}" >&2
@@ -59,6 +65,15 @@ declare -A tb_dirs=(
 )
 
 # Check if installation type is present
+run_quick_check() {
+    # Prevent package-manager commands from hanging the whole audit.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5s "$@" >/dev/null 2>&1
+    else
+        "$@" >/dev/null 2>&1
+    fi
+}
+
 is_installed() {
     local tb_type="$1"
     case "${tb_type}" in
@@ -66,10 +81,10 @@ is_installed() {
             command -v thunderbird &>/dev/null && [[ ! $(which thunderbird) =~ snap ]]
             ;;
         Flatpak)
-            command -v flatpak &>/dev/null && flatpak info org.mozilla.Thunderbird &>/dev/null 2>&1
+            command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird
             ;;
         Snap)
-            snap list thunderbird &>/dev/null 2>&1
+            command -v snap &>/dev/null && run_quick_check snap list thunderbird
             ;;
     esac
 }
@@ -140,9 +155,78 @@ parse_profiles_ini() {
 # Get active profile from Install section
 get_active_profile_install() {
     local profiles_ini="$1"
+    local tb_dir="$2"
     [[ -f "${profiles_ini}" ]] || return
 
-    awk -F= '/^\[Install/{found=1} found && /^Default=/{print $2; exit}' "${profiles_ini}"
+    local section def locked resolved
+    declare -A seen_existing_locked=()
+    declare -A seen_existing=()
+    declare -A seen_any=()
+    local existing_locked_count=0
+    local existing_count=0
+    local any_count=0
+    local first_existing_locked=""
+    local first_existing=""
+    local first_any=""
+
+    while IFS='|' read -r section def locked; do
+        [[ -n "${def}" ]] || continue
+        if [[ "${def}" = /* ]]; then
+            resolved="${def}"
+        else
+            resolved="${tb_dir}/${def}"
+        fi
+
+        if [[ -z "${seen_any[${def}]+x}" ]]; then
+            seen_any["${def}"]=1
+            ((any_count++)) || true
+            [[ -z "${first_any}" ]] && first_any="${def}"
+        fi
+
+        if [[ -d "${resolved}" ]]; then
+            if [[ -z "${seen_existing[${def}]+x}" ]]; then
+                seen_existing["${def}"]=1
+                ((existing_count++)) || true
+                [[ -z "${first_existing}" ]] && first_existing="${def}"
+            fi
+            if [[ "${locked}" == "1" && -z "${seen_existing_locked[${def}]+x}" ]]; then
+                seen_existing_locked["${def}"]=1
+                ((existing_locked_count++)) || true
+                [[ -z "${first_existing_locked}" ]] && first_existing_locked="${def}"
+            fi
+        fi
+    done < <(
+        awk -F= '
+            /^\[Install[^]]*\]/ {
+                if (in_install && def != "") print section "|" def "|" locked
+                in_install=1
+                section=$0
+                gsub(/^\[/, "", section)
+                gsub(/\]$/, "", section)
+                def=""
+                locked="0"
+                next
+            }
+            /^\[/ {
+                if (in_install && def != "") print section "|" def "|" locked
+                in_install=0
+                next
+            }
+            in_install && /^Default=/ { def=$2 }
+            in_install && /^Locked=1$/ { locked="1" }
+            END {
+                if (in_install && def != "") print section "|" def "|" locked
+            }
+        ' "${profiles_ini}"
+    )
+
+    if (( existing_locked_count == 1 )); then
+        echo "${first_existing_locked}"
+    elif (( existing_count == 1 )); then
+        echo "${first_existing}"
+    elif (( any_count == 1 )); then
+        echo "${first_any}"
+    fi
 }
 
 ensure_profile_default_flag() {
@@ -371,13 +455,13 @@ audit_tb_dir() {
             if [[ "${mode}" == "report" ]]; then
                 echo -e "  ${RED}[orphan]${NC}  ${dir}  ${size}"
             elif [[ "${mode}" == "fix" ]]; then
-                prompt_remove "${dir}"
+                prompt_remove "${dir}" "${tb_dir}"
             fi
             has_orphans=true
             if [[ ! -f "${dir}/prefs.js" ]]; then
                 ((unknown_count++)) || true
             fi
-        done < <(find "${tb_dir}" -maxdepth 1 -type d -name "*.default*" -print0 2>/dev/null)
+        done < <(find "${tb_dir}" -maxdepth 1 -mindepth 1 -type d ! -name "Crash Reports" ! -name "Pending Pings" -print0 2>/dev/null)
         if ! "${has_orphans}" && [[ "${mode}" == "report" ]]; then
             echo "  No profile directories found"
         fi
@@ -395,7 +479,7 @@ audit_tb_dir() {
 
     # Get active profile path
     local active_profile
-    active_profile=$(get_active_profile_install "${profiles_ini}")
+    active_profile=$(get_active_profile_install "${profiles_ini}" "${tb_dir}")
     local active_source="Install"
 
     # Build list of declared profile paths
@@ -486,7 +570,7 @@ audit_tb_dir() {
             fi
             ((profile_count++)) || true
         elif [[ "${mode}" == "fix" ]] && [[ "${status}" != "[active]" ]] && [[ -d "${full_path}" ]]; then
-            prompt_remove_profile "${full_path}" "${profiles_ini}" "${profile_raw_paths[${full_path}]}" "${tb_dir}"
+            prompt_remove_profile "${full_path}" "${profiles_ini}" "${profile_raw_paths[${full_path}]}" "${name}" "${tb_dir}"
         fi
     done
 
@@ -503,7 +587,7 @@ audit_tb_dir() {
                     echo -e "  ${RED}[orphan]${NC}  ${dir}  ${size}  ← not in profiles.ini"
                     ((orphan_count++)) || true
                 elif [[ "${mode}" == "fix" ]]; then
-                    prompt_remove "${dir}"
+                    prompt_remove "${dir}" "${tb_dir}"
                 fi
             elif [[ "${mode}" == "report" ]]; then
                 local has_compat="no"
@@ -540,13 +624,17 @@ changes_made=false
 
 prompt_remove() {
     local dir="$1"
+    local tb_root="${2:-}"
 
     echo
     read -rp "  Remove orphaned profile '${dir}'? [y/N] " confirm < /dev/tty
     if [[ "${confirm}" == [yY] ]]; then
         local size
         size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
-        rm -rf "${dir}"
+        if ! safe_remove_dir "${dir}" "${tb_root}"; then
+            echo -e "  ${RED}Refused to remove unsafe path${NC}: ${dir}"
+            return
+        fi
         echo -e "  ${GREEN}Removed${NC} ${dir} (freed ${size})"
         changes_made=true
     else
@@ -557,24 +645,44 @@ prompt_remove() {
 remove_from_profiles_ini() {
     local profiles_ini="$1"
     local path_value="$2"
+    local name_value="$3"
 
-    awk -v path="Path=${path_value}" '
+    awk -v path="Path=${path_value}" -v name="Name=${name_value}" '
+        function flush_profile() {
+            if (buf == "") return
+            if (match_path && (name == "Name=" || match_name)) {
+                buf=""
+                match_path=0
+                match_name=0
+                return
+            }
+            printf "%s", buf
+            buf=""
+            match_path=0
+            match_name=0
+        }
         /^\[Profile[0-9]+\]/ {
-            if (buf != "" && !skip) printf "%s", buf
-            skip=0; buf=$0 ORS; next
+            flush_profile()
+            in_profile=1
+            buf=$0 ORS
+            next
         }
         /^\[/ {
-            if (buf != "" && !skip) printf "%s", buf
-            skip=0; buf=""
-            print; next
+            if (in_profile) {
+                flush_profile()
+                in_profile=0
+            }
+            print
+            next
         }
-        buf != "" {
-            if ($0 == path) skip=1
+        in_profile {
+            if ($0 == path) match_path=1
+            if (name != "Name=" && $0 == name) match_name=1
             buf = buf $0 ORS
             next
         }
         { print }
-        END { if (buf != "" && !skip) printf "%s", buf }
+        END { if (in_profile) flush_profile() }
     ' "${profiles_ini}" > "${profiles_ini}.tmp" && mv "${profiles_ini}.tmp" "${profiles_ini}"
 }
 
@@ -582,7 +690,8 @@ prompt_remove_profile() {
     local dir="$1"
     local profiles_ini="$2"
     local raw_path="$3"
-    local tb_dir="$4"
+    local name="$4"
+    local tb_dir="$5"
 
     echo
     if [[ -n "${tb_dir}" ]] && [[ "${dir}" != "${tb_dir}"/* ]]; then
@@ -597,12 +706,62 @@ prompt_remove_profile() {
     if [[ "${confirm}" == [yY] ]]; then
         local size
         size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
-        rm -rf "${dir}"
-        remove_from_profiles_ini "${profiles_ini}" "${raw_path}"
+        if ! safe_remove_dir "${dir}"; then
+            echo -e "  ${RED}Refused to remove unsafe path${NC}: ${dir}"
+            return
+        fi
+        remove_from_profiles_ini "${profiles_ini}" "${raw_path}" "${name}"
         ensure_profile_default_flag "${profiles_ini}"
         echo -e "  ${GREEN}Removed${NC} ${dir} (freed ${size})"
         echo -e "  ${GREEN}Removed entry from profiles.ini${NC}"
         changes_made=true
+    else
+        echo "  Skipped"
+    fi
+}
+
+safe_remove_dir() {
+    local dir="$1"
+    local must_be_under="${2:-}"
+    local resolved
+    resolved=$(readlink -f "${dir}" 2>/dev/null || true)
+    [[ -n "${resolved}" ]] || return 1
+    [[ -d "${resolved}" ]] || return 1
+    [[ "${resolved}" != "/" ]] || return 1
+    [[ "${resolved}" != "${HOME}" ]] || return 1
+    [[ "${resolved}" != "${HOME}/" ]] || return 1
+    if [[ -n "${must_be_under}" ]]; then
+        local root
+        root=$(readlink -f "${must_be_under}" 2>/dev/null || true)
+        [[ -n "${root}" ]] || return 1
+        [[ "${resolved}" == "${root}"/* ]] || return 1
+    fi
+    rm -rf -- "${resolved}"
+}
+
+remove_install_data() {
+    local tb_type="$1"
+    local tb_dir="${tb_dirs[${tb_type}]}"
+
+    echo -e "\n${BOLD}--- Remove: ${tb_type} (${tb_dir}) ---${NC}"
+
+    if [[ ! -d "${tb_dir}" ]]; then
+        echo "  No data directory found, nothing to remove."
+        return
+    fi
+
+    local size
+    size=$(du -sh "${tb_dir}" 2>/dev/null | cut -f1)
+    echo -e "  Size: ${size}"
+    echo -e "  ${RED}WARNING: This will permanently delete ALL ${tb_type} Thunderbird data!${NC}"
+    read -rp "  Type 'yes' to confirm removal of '${tb_dir}': " confirm < /dev/tty
+    if [[ "${confirm}" == "yes" ]]; then
+        if safe_remove_dir "${tb_dir}"; then
+            echo -e "  ${GREEN}Removed${NC} ${tb_dir} (freed ${size})"
+            changes_made=true
+        else
+            echo -e "  ${RED}Failed to remove${NC} ${tb_dir}"
+        fi
     else
         echo "  Skipped"
     fi
@@ -631,6 +790,32 @@ if "${fix_mode}"; then
     if "${changes_made}"; then
         echo
         echo -e "${BOLD}Post-fix Report${NC}"
+        echo "========================="
+        run_audit report
+    fi
+fi
+
+if [[ ${#remove_types[@]} -gt 0 ]]; then
+    echo
+    echo -e "${BOLD}Remove Install Data${NC}"
+    echo "========================="
+    for raw_type in "${remove_types[@]}"; do
+        tb_type=""
+        for known in System Flatpak Snap; do
+            if [[ "${raw_type,,}" == "${known,,}" ]]; then
+                tb_type="${known}"
+                break
+            fi
+        done
+        if [[ -z "${tb_type}" ]]; then
+            echo -e "  ${RED}Unknown type:${NC} ${raw_type} (valid: System, Flatpak, Snap)"
+            continue
+        fi
+        remove_install_data "${tb_type}"
+    done
+    if "${changes_made}"; then
+        echo
+        echo -e "${BOLD}Post-remove Report${NC}"
         echo "========================="
         run_audit report
     fi

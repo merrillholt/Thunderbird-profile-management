@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Review Actions</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: sans-serif;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        padding: 12px;
+      }
+
+      h1 {
+        font-size: 16px;
+        margin: 0 0 8px;
+      }
+
+      p {
+        margin: 0 0 12px;
+        line-height: 1.4;
+      }
+
+      .meta {
+        font-size: 12px;
+        opacity: 0.8;
+      }
+
+      .actions {
+        display: grid;
+        gap: 8px;
+      }
+
+      button {
+        font: inherit;
+        padding: 8px 10px;
+      }
+
+      #status {
+        margin-top: 10px;
+        min-height: 1.4em;
+        font-size: 12px;
+      }
+
+      .error {
+        color: #b00020;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Review Actions</h1>
+    <p id="summary">Loading message context…</p>
+    <p class="meta" id="folder"></p>
+    <div class="actions">
+      <button id="approve" type="button">Approve sender</button>
+      <button id="trash" type="button">Mark trash</button>
+      <button id="junk" type="button">Mark junk</button>
+    </div>
+    <div id="status" aria-live="polite"></div>
+    <script src="popup.js"></script>
+  </body>
+  </html>

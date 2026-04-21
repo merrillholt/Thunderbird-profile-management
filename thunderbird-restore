@@ -3,20 +3,24 @@ set -euo pipefail
 
 log_file="${HOME}/thunderbird-restore.log"
 dry_run=false
+self_test=false
+self_test_root=""
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run]
+Usage: $(basename "$0") [--dry-run] [--self-test]
 
 Options:
-  --dry-run   Show what would be restored without making changes
-  -h, --help  Show this help
+  --dry-run    Show what would be restored without making changes
+  --self-test  Run a safe self-test using temporary data
+  -h, --help   Show this help
 EOF
 }
 
 for arg in "$@"; do
     case "${arg}" in
         --dry-run) dry_run=true ;;
+        --self-test) self_test=true ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "Error: Unknown option: ${arg}" >&2
@@ -30,33 +34,119 @@ pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
 
+setup_self_test() {
+    local root
+    self_test_root=$(mktemp -d)
+    root="${self_test_root}"
+    trap 'rm -rf "${self_test_root}"' EXIT
+    tb_type="SelfTest"
+    tb_version="self-test"
+    tb_dir="${root}/tb"
+    src="${root}/backup/${backup_root_rel}/thunderbird/"
+    log_file="${root}/thunderbird-restore.log"
+
+    mkdir -p "${tb_dir}/restore.target"
+    cat <<EOF > "${tb_dir}/profiles.ini"
+[Profile0]
+Name=SelfTest
+IsRelative=1
+Path=restore.target
+Default=1
+
+[InstallSelfTest]
+Default=restore.target
+Locked=1
+EOF
+
+    mkdir -p "${src}"
+    echo 'user_pref("mail.server.server1.hostname", "example.com");' > "${src}/prefs.js"
+    cat <<EOF > "${src}/.backup_manifest"
+date=$(date '+%Y-%m-%d %H:%M:%S')
+thunderbird=${tb_type}
+thunderbird_version=${tb_version}
+profile=SelfTest
+source=${src}
+destination=${tb_dir}/restore.target/
+file_count=1
+profile_size=$(du -sh "${src}" | cut -f1)
+EOF
+}
+
 # Locate backup source — check local sync first, then virtual drive
-if [[ -d "${pcloud_mount}" ]]; then
-    if ! mountpoint -q "${pcloud_mount}"; then
-        echo "Error: ${pcloud_mount} exists but is not mounted." >&2
+if "${self_test}"; then
+    setup_self_test
+else
+    if [[ -d "${pcloud_mount}" ]]; then
+        if [[ ! -r "${pcloud_mount}" ]]; then
+            echo "Error: ${pcloud_mount} is not readable." >&2
+            exit 1
+        fi
+        src="${pcloud_mount}/${backup_root_rel}/thunderbird/"
+    elif [[ -d "${pcloud_drive}" ]]; then
+        src="${pcloud_drive}/${backup_root_rel}/thunderbird/"
+    else
+        echo "Error: No Thunderbird backup found in pCloud" >&2
         exit 1
     fi
-    src="${pcloud_mount}/${backup_root_rel}/thunderbird/"
-elif [[ -d "${pcloud_drive}" ]]; then
-    src="${pcloud_drive}/${backup_root_rel}/thunderbird/"
-else
-    echo "Error: No Thunderbird backup found in pCloud" >&2
-    exit 1
 fi
 
+backup_root="$(dirname "${src%/}")"
+profile_root_src="${backup_root}/profile-root"
+metadata_src="${backup_root}/metadata"
+
+run_quick_check() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5s "$@" >/dev/null 2>&1
+    else
+        "$@" >/dev/null 2>&1
+    fi
+}
+
 # Detect Thunderbird installation and set profile directory accordingly
-if command -v flatpak &>/dev/null && flatpak info org.mozilla.Thunderbird &>/dev/null; then
-    tb_type="Flatpak"
-    tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
-elif snap list thunderbird &>/dev/null; then
-    tb_type="Snap"
-    tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
-elif command -v thunderbird &>/dev/null; then
-    tb_type="System"
-    tb_dir="${HOME}/.thunderbird"
-else
-    echo "Error: No Thunderbird installation found" >&2
-    exit 1
+if ! "${self_test}"; then
+    if command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird; then
+        tb_type="Flatpak"
+        tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+    elif command -v snap &>/dev/null && run_quick_check snap list thunderbird; then
+        tb_type="Snap"
+        tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
+    elif command -v thunderbird &>/dev/null; then
+        tb_type="System"
+        tb_dir="${HOME}/.thunderbird"
+    else
+        echo "Error: No Thunderbird installation found" >&2
+        exit 1
+    fi
+fi
+
+get_tb_version() {
+    local detected_type="$1"
+    local version="unknown"
+    case "${detected_type}" in
+        Flatpak)
+            if command -v timeout >/dev/null 2>&1; then
+                version=$(timeout 5s flatpak info org.mozilla.Thunderbird 2>/dev/null | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
+            else
+                version=$(flatpak info org.mozilla.Thunderbird 2>/dev/null | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
+            fi
+            ;;
+        *)
+            if command -v thunderbird >/dev/null 2>&1; then
+                version=$(thunderbird --version 2>/dev/null | awk '{print $2}' || true)
+            fi
+            ;;
+    esac
+    [[ -n "${version}" ]] || version="unknown"
+    echo "${version}"
+}
+
+get_major_version() {
+    local version="$1"
+    echo "${version}" | grep -oE '[0-9]+' | head -n1
+}
+
+if ! "${self_test}"; then
+    tb_version=$(get_tb_version "${tb_type}")
 fi
 
 profiles_ini="${tb_dir}/profiles.ini"
@@ -67,9 +157,83 @@ if [[ ! -f "${profiles_ini}" ]]; then
     exit 1
 fi
 
-# Determine the active profile from the locked Install section in profiles.ini,
-# fallback to the profile marked Default=1.
-active_profile=$(awk -F= '/^\[Install/{found=1} found && /^Default=/{print $2; exit}' "${profiles_ini}")
+select_install_default() {
+    local ini="$1"
+    local base_dir="$2"
+    local section def locked resolved
+    declare -A seen_existing_locked=()
+    declare -A seen_existing=()
+    declare -A seen_any=()
+    local existing_locked_count=0
+    local existing_count=0
+    local any_count=0
+    local first_existing_locked=""
+    local first_existing=""
+    local first_any=""
+
+    while IFS='|' read -r section def locked; do
+        [[ -n "${def}" ]] || continue
+        if [[ "${def}" = /* ]]; then
+            resolved="${def}"
+        else
+            resolved="${base_dir}/${def}"
+        fi
+
+        if [[ -z "${seen_any[${def}]+x}" ]]; then
+            seen_any["${def}"]=1
+            ((any_count++)) || true
+            [[ -z "${first_any}" ]] && first_any="${def}"
+        fi
+
+        if [[ -d "${resolved}" ]]; then
+            if [[ -z "${seen_existing[${def}]+x}" ]]; then
+                seen_existing["${def}"]=1
+                ((existing_count++)) || true
+                [[ -z "${first_existing}" ]] && first_existing="${def}"
+            fi
+            if [[ "${locked}" == "1" && -z "${seen_existing_locked[${def}]+x}" ]]; then
+                seen_existing_locked["${def}"]=1
+                ((existing_locked_count++)) || true
+                [[ -z "${first_existing_locked}" ]] && first_existing_locked="${def}"
+            fi
+        fi
+    done < <(
+        awk -F= '
+            /^\[Install[^]]*\]/ {
+                if (in_install && def != "") print section "|" def "|" locked
+                in_install=1
+                section=$0
+                gsub(/^\[/, "", section)
+                gsub(/\]$/, "", section)
+                def=""
+                locked="0"
+                next
+            }
+            /^\[/ {
+                if (in_install && def != "") print section "|" def "|" locked
+                in_install=0
+                next
+            }
+            in_install && /^Default=/ { def=$2 }
+            in_install && /^Locked=1$/ { locked="1" }
+            END {
+                if (in_install && def != "") print section "|" def "|" locked
+            }
+        ' "${ini}"
+    )
+
+    if (( existing_locked_count == 1 )); then
+        echo "${first_existing_locked}"
+    elif (( existing_count == 1 )); then
+        echo "${first_existing}"
+    elif (( any_count == 1 )); then
+        echo "${first_any}"
+    fi
+}
+
+# Determine active profile from [Install*] sections.
+# If ambiguous/missing, fallback to Profile Default=1.
+active_profile=$(select_install_default "${profiles_ini}" "${tb_dir}")
 
 if [[ -n "${active_profile}" ]]; then
     if [[ "${active_profile}" = /* ]]; then
@@ -108,13 +272,24 @@ else
 fi
 
 dest="${profile_path}/"
-mkdir -p "${dest}"
 
 check_thunderbird_running() {
-    pgrep -x thunderbird &>/dev/null || flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird
+    pgrep -x thunderbird &>/dev/null || { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
 }
 
-if ! "${dry_run}" && check_thunderbird_running; then
+reset_profile_runtime_state() {
+    local profile_dir="$1"
+    rm -f "${profile_dir}/compatibility.ini" 2>/dev/null || true
+    rm -f "${profile_dir}/addonStartup.json.lz4" 2>/dev/null || true
+    rm -rf "${profile_dir}/startupCache" 2>/dev/null || true
+    if [[ "${tb_type}" == "Flatpak" ]]; then
+        local profile_name
+        profile_name=$(basename "${profile_dir}")
+        rm -rf "${HOME}/.var/app/org.mozilla.Thunderbird/cache/thunderbird/${profile_name}/startupCache" 2>/dev/null || true
+    fi
+}
+
+if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
     echo "Thunderbird is running."
     read -rp "Kill Thunderbird before restoring? [y/N] " confirm_kill
     if [[ "${confirm_kill}" != [yY] ]]; then
@@ -132,6 +307,7 @@ fi
 
 # Show restore plan and confirm
 echo "Thunderbird: ${tb_type}"
+echo "Version: ${tb_version}"
 echo "Active profile: ${active_profile}"
 if "${dry_run}"; then
     echo "Dry run: ${src} -> ${dest}"
@@ -139,7 +315,7 @@ else
     echo "Restoring from ${src} to ${dest}"
 fi
 echo
-if ! "${dry_run}"; then
+if ! "${dry_run}" && ! "${self_test}"; then
     read -rp "This will overwrite the current profile. Continue? [y/N] " confirm
     if [[ "${confirm}" != [yY] ]]; then
         echo "Restore cancelled."
@@ -153,8 +329,9 @@ if [[ ! -f "${src}/prefs.js" ]]; then
 fi
 
 manifest_file="${src}/.backup_manifest"
+manifest_profile=""
 if [[ ! -f "${manifest_file}" ]]; then
-    if ! "${dry_run}"; then
+    if ! "${dry_run}" && ! "${self_test}"; then
         echo "Warning: Backup manifest not found: ${manifest_file}" >&2
         read -rp "Continue anyway? [y/N] " confirm_manifest
         if [[ "${confirm_manifest}" != [yY] ]]; then
@@ -168,6 +345,43 @@ else
         echo "Error: Backup manifest appears invalid: ${manifest_file}" >&2
         exit 1
     fi
+    manifest_tb_type=$(awk -F= '/^thunderbird=/{print $2}' "${manifest_file}")
+    manifest_tb_version=$(awk -F= '/^thunderbird_version=/{print $2}' "${manifest_file}")
+    manifest_profile=$(awk -F= '/^profile=/{print $2}' "${manifest_file}")
+    if [[ -n "${manifest_tb_type}" && "${manifest_tb_type}" != "${tb_type}" ]]; then
+        echo "Warning: Backup was created from ${manifest_tb_type}, restore target is ${tb_type}."
+    fi
+    if [[ -n "${manifest_tb_version}" && "${manifest_tb_version}" != "unknown" && "${tb_version}" != "unknown" && "${manifest_tb_version}" != "${tb_version}" ]]; then
+        echo "Warning: Backup Thunderbird version (${manifest_tb_version}) differs from target (${tb_version})."
+        backup_major=$(get_major_version "${manifest_tb_version}")
+        target_major=$(get_major_version "${tb_version}")
+        if [[ -n "${backup_major}" && -n "${target_major}" && "${target_major}" -lt "${backup_major}" ]]; then
+            echo "Warning: Target appears older than backup source. This can cause startup/profile errors."
+        fi
+        if ! "${dry_run}" && ! "${self_test}"; then
+            read -rp "Continue with version mismatch? [y/N] " confirm_version_mismatch
+            if [[ "${confirm_version_mismatch}" != [yY] ]]; then
+                echo "Restore cancelled."
+                exit 0
+            fi
+        fi
+    fi
+fi
+
+if [[ -d "${profile_root_src}" ]]; then
+    if [[ -f "${profile_root_src}/profiles.ini" ]]; then
+        echo "Backup includes profile registry: ${profile_root_src}/profiles.ini"
+    fi
+    if [[ -f "${profile_root_src}/installs.ini" ]]; then
+        echo "Backup includes install registry: ${profile_root_src}/installs.ini"
+    fi
+fi
+if [[ -d "${metadata_src}" ]]; then
+    echo "Backup includes install metadata: ${metadata_src}"
+fi
+if [[ -n "${manifest_profile}" && -n "${active_profile}" && "${manifest_profile}" != "${active_profile}" ]]; then
+    echo "Note: Backup profile name (${manifest_profile}) differs from target active profile (${active_profile})."
+    echo "      This restore will copy profile contents into the target active profile."
 fi
 
 resolved_dest=$(readlink -f "${dest}")
@@ -179,11 +393,22 @@ fi
 
 echo
 start_time=$(date +%s)
+tmp_dry_dest=""
+rsync_dest="${dest}"
 if "${dry_run}"; then
-    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='parent.lock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${dest}")
+    tmp_dry_dest=$(mktemp -d)
+    rsync_dest="${tmp_dry_dest}/"
 else
-    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='parent.lock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
+    mkdir -p "${dest}"
 fi
+
+if "${dry_run}"; then
+    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${rsync_dest}")
+else
+    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
+    reset_profile_runtime_state "${dest%/}"
+fi
+[[ -n "${tmp_dry_dest}" ]] && rm -rf "${tmp_dry_dest}"
 end_time=$(date +%s)
 elapsed=$(( end_time - start_time ))
 
@@ -200,9 +425,14 @@ fi
 files_transferred=$(echo "${rsync_output}" | awk '/Number of regular files transferred:/{print $NF}')
 total_size=$(echo "${rsync_output}" | awk '/Total file size:/{print $4, $5}')
 sent=$(echo "${rsync_output}" | awk '/Total bytes sent:/{if ($5!="") print $4" "$5; else print $4}')
-restored_size=$(du -sh "${dest}" | cut -f1)
 profile_size=$(du -sh "${src}" | cut -f1)
-file_count=$(find "${dest}" -type f | wc -l)
+if "${dry_run}"; then
+    restored_size="n/a"
+    file_count="n/a"
+else
+    restored_size=$(du -sh "${dest}" | cut -f1)
+    file_count=$(find "${dest}" -type f | wc -l)
+fi
 
 # Report
 report=$(cat <<EOF
@@ -211,6 +441,7 @@ report=$(cat <<EOF
 ==============================
   Date:               $(date '+%Y-%m-%d %H:%M:%S')
   Thunderbird:        ${tb_type}
+  Version:            ${tb_version}
   Profile:            ${active_profile}
   Source:             ${src}
   Destination:        ${dest}
@@ -218,10 +449,10 @@ report=$(cat <<EOF
   Files transferred:  ${files_transferred}
   Data transferred:   ${sent}
   Total files:        ${file_count}
-  Restored size:      ${restored_size}${dry_run:+ (current profile)}
+  Restored size:      ${restored_size}
   Profile size:       ${profile_size}
 ==============================
-  Restore ${dry_run:+(dry run) }complete.
+  Restore $("${dry_run}" && echo "(dry run) ")complete.
 ==============================
 EOF
 )
