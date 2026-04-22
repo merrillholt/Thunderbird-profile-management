@@ -21,12 +21,39 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_PROFILE = Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird/bqmdw26k.default-default"
-DEFAULT_RULES = {
-    "gmail": DEFAULT_PROFILE / "ImapMail/imap.gmail.com/msgFilterRules.dat",
-    "bluerug": DEFAULT_PROFILE / "ImapMail/mail.bluerug.org/msgFilterRules.dat",
-    "comcast": DEFAULT_PROFILE / "ImapMail/imap.comcast.net/msgFilterRules.dat",
-}
+FLATPAK_TB_DIR = Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird"
+
+
+def find_default_profile(tb_dir: Path) -> Path:
+    import configparser
+    ini = tb_dir / "profiles.ini"
+    if ini.exists():
+        cp = configparser.ConfigParser()
+        cp.read(ini)
+        for section in cp.sections():
+            if cp.get(section, "default", fallback="") == "1":
+                rel = cp.get(section, "path", fallback="")
+                if rel:
+                    is_relative = cp.get(section, "isrelative", fallback="1") == "1"
+                    return tb_dir / rel if is_relative else Path(rel)
+    # fallback: first directory that looks like a profile
+    candidates = sorted(tb_dir.glob("*.default*"))
+    if candidates:
+        return candidates[0]
+    raise RuntimeError(f"No Thunderbird profile found in {tb_dir}")
+
+
+DEFAULT_PROFILE = find_default_profile(FLATPAK_TB_DIR)
+
+
+def find_default_rules(profile: Path) -> dict[str, Path]:
+    rules = {}
+    for dat in sorted((profile / "ImapMail").glob("*/msgFilterRules.dat")):
+        rules[dat.parent.name] = dat
+    return rules
+
+
+DEFAULT_RULES = find_default_rules(DEFAULT_PROFILE)
 DEFAULT_FOLDER = DEFAULT_PROFILE / "Mail/Local Folders/Review"
 
 
@@ -427,7 +454,7 @@ def eval_node(node, msg: mailbox.mboxMessage, context: EvalContext) -> EvalResul
             if result.matched:
                 return EvalResult(True, notes)
             failures.extend(result.failures)
-        return EvalResult(False, notes, [f"none of OR matched: {'; '.join(failures)}"] if failures else [])
+        return EvalResult(False, notes, failures)
     if kind == "ATOM":
         return eval_atom(node[1], node[2], node[3], msg, context)
     raise ValueError(f"unknown node kind {kind}")
@@ -448,7 +475,7 @@ def eval_atom(field_name: str, op: str, value: str, msg: mailbox.mboxMessage, co
     if field == "from":
         if op_l == "contains":
             matched = value_l in message_from_text(msg).lower()
-            return atom_result(matched, field_name, op, value, f"from is {message_from_text(msg)!r}")
+            return atom_result(matched, field_name, op, value, None)
         if op_l == "is in ab":
             allowed = context.books.emails_for_uri(value)
             matched = bool(message_from_emails(msg) & allowed)
@@ -483,10 +510,12 @@ def eval_atom(field_name: str, op: str, value: str, msg: mailbox.mboxMessage, co
     return EvalResult(False, [f"unsupported condition: {text}"], [f"{text} unsupported"])
 
 
-def atom_result(matched: bool, field_name: str, op: str, value: str, detail: str) -> EvalResult:
+def atom_result(matched: bool, field_name: str, op: str, value: str, detail: str | None) -> EvalResult:
     if matched:
         return EvalResult(True)
-    return EvalResult(False, failures=[f"{format_atom(field_name, op, value)} failed: {detail}"])
+    atom = format_atom(field_name, op, value)
+    msg = f"{atom} failed: {detail}" if detail else f"{atom} failed"
+    return EvalResult(False, failures=[msg])
 
 
 def format_atom(field_name: str, op: str, value: str) -> str:
@@ -539,11 +568,61 @@ def first_match(rules: Iterable[Rule], msg: mailbox.mboxMessage, context: EvalCo
     return None, notes, failures_by_rule
 
 
+def find_account_for_message(msg: mailbox.mboxMessage, profile: Path) -> str | None:
+    mid = msg.get("message-id", "").strip()
+    if not mid:
+        return None
+    for inbox in sorted((profile / "ImapMail").glob("*/INBOX")):
+        account = inbox.parent.name
+        try:
+            for inbox_msg in mailbox.mbox(inbox, create=False):
+                if inbox_msg.get("message-id", "").strip() == mid:
+                    return account
+        except Exception:
+            continue
+    return None
+
+
 def format_actions(rule: Rule) -> str:
     chunks = []
     for action, value in rule.actions:
         chunks.append(f"{action}={value}" if value is not None else action)
     return "; ".join(chunks)
+
+
+def interactive_prompt(args, parser):
+    accounts = sorted(DEFAULT_RULES)
+    print(f"Accounts ({', '.join(accounts)}) [default: all, or comma-separated subset]: ", end="", flush=True)
+    account_input = input().strip()
+    if account_input:
+        chosen = [a.strip() for a in account_input.split(",") if a.strip() in accounts]
+        if chosen:
+            args.account = chosen
+
+    print("Search (from/subject filter) [default: none]: ", end="", flush=True)
+    search_input = input().strip()
+    if search_input:
+        args.search = search_input
+
+    print(f"Limit [default: {args.limit}]: ", end="", flush=True)
+    limit_input = input().strip()
+    if limit_input.isdigit():
+        args.limit = int(limit_input)
+
+    print("Show notes? [y/N]: ", end="", flush=True)
+    if input().strip().lower() == "y":
+        args.show_notes = True
+
+    print("Show why rules failed? [y/N]: ", end="", flush=True)
+    if input().strip().lower() == "y":
+        args.why = True
+
+    print("Preserve existing tags? [y/N]: ", end="", flush=True)
+    if input().strip().lower() == "y":
+        args.preserve_tags = True
+
+    print()
+    return args
 
 
 def main() -> int:
@@ -561,7 +640,11 @@ def main() -> int:
         action="store_true",
         help="Evaluate tag conditions using existing Thunderbird tags. By default, generated tbq/processed tags are ignored.",
     )
+    parser.add_argument("-i", "--interactive", action="store_true", help="Prompt for options interactively.")
     args = parser.parse_args()
+
+    if args.interactive:
+        args = interactive_prompt(args, parser)
 
     rule_files: list[tuple[str, Path]] = []
     if args.rules:
@@ -581,6 +664,19 @@ def main() -> int:
         print("No rule files found.", file=sys.stderr)
         return 2
 
+    warned = False
+    for account, rules in parsed_rules:
+        for rule in rules:
+            if not rule.enabled:
+                continue
+            try:
+                parse_condition(rule.condition)
+            except Exception as exc:
+                print(f"warning: {account}: {rule.name!r}: condition parse error: {exc}", file=sys.stderr)
+                warned = True
+    if warned:
+        print("warning: rules with parse errors will never match", file=sys.stderr)
+
     mbox = mailbox.mbox(args.folder, create=False)
     search = args.search.lower() if args.search else None
     shown = 0
@@ -595,7 +691,19 @@ def main() -> int:
         print(f"  Subject: {subject}")
         display_tags = message_tags(msg, preserve=True)
         print(f"  Tags: {', '.join(sorted(display_tags)) or '(none)'}")
-        for account, rules in parsed_rules:
+
+        if not args.account and not args.rules:
+            matched_account = find_account_for_message(msg, args.profile)
+            if matched_account:
+                active_rules = [(a, r) for a, r in parsed_rules if a == matched_account]
+                print(f"  Account: {matched_account}")
+            else:
+                active_rules = parsed_rules
+                print(f"  Account: (not found in any inbox, evaluating all)")
+        else:
+            active_rules = parsed_rules
+
+        for account, rules in active_rules:
             rule, notes, failures_by_rule = first_match(rules, msg, context)
             if rule:
                 print(f"  {account}: {rule.name}")
