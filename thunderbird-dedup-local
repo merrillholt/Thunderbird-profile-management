@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Deduplicate messages in Thunderbird Local Folders mbox files by Message-ID."""
+
+from __future__ import annotations
+
+import argparse
+import mailbox
+import shutil
+import sys
+from pathlib import Path
+
+
+FLATPAK_TB_DIR = Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird"
+
+SKIP_NAMES = {"msgFilterRules.dat", "filterlog.html", "Unsent Messages"}
+
+
+def find_default_profile(tb_dir: Path) -> Path:
+    import configparser
+    ini = tb_dir / "profiles.ini"
+    if ini.exists():
+        cp = configparser.ConfigParser()
+        cp.read(ini)
+        for section in cp.sections():
+            if cp.get(section, "default", fallback="") == "1":
+                rel = cp.get(section, "path", fallback="")
+                if rel:
+                    is_relative = cp.get(section, "isrelative", fallback="1") == "1"
+                    return tb_dir / rel if is_relative else Path(rel)
+    candidates = sorted(tb_dir.glob("*.default*"))
+    if candidates:
+        return candidates[0]
+    raise RuntimeError(f"No Thunderbird profile found in {tb_dir}")
+
+
+def message_key(msg: mailbox.mboxMessage) -> str:
+    mid = msg.get("message-id", "").strip()
+    if mid:
+        return mid
+    return f"no-mid\x00{msg.get('from', '')}\x00{msg.get('subject', '')}\x00{msg.get('date', '')}"
+
+
+def dedup_folder(path: Path, apply: bool, verbose: bool) -> tuple[int, int]:
+    box = mailbox.mbox(str(path))
+    messages = list(box)
+    box.close()
+
+    seen: set[str] = set()
+    keep: list[mailbox.mboxMessage] = []
+    dups: list[tuple[int, mailbox.mboxMessage]] = []
+
+    for i, msg in enumerate(messages):
+        key = message_key(msg)
+        if key in seen:
+            dups.append((i, msg))
+        else:
+            seen.add(key)
+            keep.append(msg)
+
+    n_total = len(messages)
+    n_dups = len(dups)
+
+    print(f"  {path.name}: {n_total} messages, {n_dups} duplicate{'s' if n_dups != 1 else ''}", end="")
+
+    if n_dups == 0:
+        print()
+        return n_total, 0
+
+    if verbose:
+        print()
+        for i, msg in dups:
+            subj = msg.get("subject", "(no subject)")[:60]
+            frm = msg.get("from", "")[:40]
+            print(f"    #{i:4d}  {frm}  —  {subj}")
+    else:
+        print()
+
+    if apply:
+        tmp = path.with_name(path.name + ".dedup.tmp")
+        try:
+            new_box = mailbox.mbox(str(tmp), create=True)
+            new_box.lock()
+            for msg in keep:
+                new_box.add(msg)
+            new_box.flush()
+            new_box.unlock()
+            new_box.close()
+            shutil.move(str(tmp), str(path))
+        except Exception:
+            if tmp.exists():
+                tmp.unlink()
+            raise
+
+        msf = path.with_suffix(".msf") if path.suffix else path.parent / (path.name + ".msf")
+        if msf.exists():
+            msf.unlink()
+
+        print(f"    → removed {n_dups}, index reset")
+
+    return n_total, n_dups
+
+
+def is_lock_live(profile: Path) -> bool:
+    """Return True only if the lock belongs to a running process on this host."""
+    import socket
+    lock = profile / "lock"
+    if lock.is_symlink():
+        target = lock.readlink()           # e.g. "127.0.1.1:+12345"
+        parts = str(target).rsplit(":", 1)
+        if len(parts) == 2:
+            pid_part = parts[1].lstrip("+")
+            try:
+                pid = int(pid_part)
+                # Check if this pid is alive
+                import os
+                os.kill(pid, 0)
+                return True                # process exists
+            except (ValueError, ProcessLookupError, PermissionError):
+                return False               # stale or unreadable pid
+        return False
+    # .parentlock is a plain file; presence alone isn't reliable — ignore it
+    return False
+
+
+def check_lock(profile: Path) -> None:
+    if is_lock_live(profile):
+        print("Thunderbird is running. Close it before applying deduplication.", file=sys.stderr)
+        sys.exit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Deduplicate Thunderbird Local Folders mbox files by Message-ID.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="By default runs in dry-run mode. Use --apply to remove duplicates.",
+    )
+    parser.add_argument("--profile", type=Path, help="Thunderbird profile directory")
+    parser.add_argument("--folder", type=Path, action="append", metavar="MBOX",
+                        help="Specific mbox file to process (may repeat); default: all local folders")
+    parser.add_argument("--apply", action="store_true", help="Remove duplicates (default is dry-run)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="List each duplicate message")
+    args = parser.parse_args()
+
+    profile = args.profile or find_default_profile(FLATPAK_TB_DIR)
+
+    if args.apply:
+        check_lock(profile)
+
+    if args.folder:
+        folders = [Path(f) for f in args.folder]
+    else:
+        local_mail = profile / "Mail" / "Local Folders"
+        if not local_mail.exists():
+            print(f"Error: Local Folders not found at {local_mail}", file=sys.stderr)
+            sys.exit(1)
+        folders = sorted(
+            p for p in local_mail.iterdir()
+            if p.is_file() and p.suffix == "" and p.name not in SKIP_NAMES
+        )
+
+    if not args.apply:
+        print("Dry-run — use --apply to remove duplicates\n")
+
+    total_msgs = total_dups = 0
+    for folder in folders:
+        try:
+            msgs, dups = dedup_folder(folder, apply=args.apply, verbose=args.verbose)
+            total_msgs += msgs
+            total_dups += dups
+        except Exception as e:
+            print(f"  ERROR: {folder.name}: {e}", file=sys.stderr)
+
+    action = "removed" if args.apply else "found"
+    print(f"\nTotal: {total_msgs} messages, {total_dups} duplicates {action}")
+    if not args.apply and total_dups > 0:
+        print("Re-run with --apply to remove them.")
+
+
+if __name__ == "__main__":
+    main()

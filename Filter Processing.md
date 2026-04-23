@@ -35,7 +35,15 @@ The original message remains in the inbox. These messages are **never** sent to 
 |------|-----------|--------------|
 | Tutor (CardBook) | CardBook: Tutor Parents or Tutor Students (`85e10055-5fa3-464f-925e-12c47856b125`) | Local Folders/Tutor |
 | Family | Sender email matches any Family contact in Whitelist | Local Folders/Family |
-| Financial | `chase.com`, `self.inc`, `paypal.com`, `affirm.com`, `upgrade.com`, `openskycc.com`, `myonlinebill.com`, `upstart.com`, `venmo.com` | Local Folders/Financial |
+| Financial | `chase.com` | Local Folders/Financial |
+| Financial (self.inc) | `self.inc` | Local Folders/Financial |
+| Financial (paypal) | `paypal.com` | Local Folders/Financial |
+| Financial (affirm) | `affirm.com` | Local Folders/Financial |
+| Financial (upgrade) | `upgrade.com` | Local Folders/Financial |
+| Financial (openskycc) | `openskycc.com` | Local Folders/Financial |
+| Financial (myonlinebill) | `myonlinebill.com` | Local Folders/Financial |
+| Financial (upstart) | `upstart.com` | Local Folders/Financial |
+| Financial (venmo) | `venmo.com` | Local Folders/Financial |
 | Mercury | `mercuryinsurance.com` | Local Folders/Mercury Insurance |
 | Kaiser | `kp.org` | Local Folders/Kaiser Permanente |
 | Steele Insurance | `siainc.net`, `steeleinsuranceagency.net` | Local Folders/Steele Insurance |
@@ -49,7 +57,9 @@ The original message remains in the inbox. These messages are **never** sent to 
 |------|-----------|--------------|
 | Tutor | `web3forms.com` | Local Folders/Tutor |
 | Family | Sender email matches any Family contact in Whitelist | Local Folders/Family |
-| Financial | `affirm.com`, `venmo.com` | Local Folders/Financial |
+| Financial | `affirm.com` | Local Folders/Financial |
+| Financial (venmo) | `venmo.com` | Local Folders/Financial |
+| Financial (paypal) | `paypal.com` | Local Folders/Financial |
 | Kaiser | `kp.org` | Local Folders/Kaiser Permanente |
 | Sterling | `sterling`, `sterlingcpas` | Local Folders/Sterling |
 | Nan Leng | `Nan Leng` in from | Local Folders/Nan Leng |
@@ -85,7 +95,7 @@ If the from address claims to be from a trusted domain (`@gmail.com`, `@bluerug.
 
 ## Catch-All Quarantine
 
-Any message that has not yet been tagged `tbq_identified` by a prior rule is copied to Local Folders/Review, tagged `copied_to_local` and `tbq_identified`, and execution stops. The original remains in the inbox.
+Any message that has not yet been tagged `tbq_identified` by a prior rule is copied to Local Folders/Review, tagged `tbq_identified`, and execution stops. The original remains in the inbox.
 
 ## Periodic Rules (gmail and bluerug only)
 
@@ -121,7 +131,7 @@ Messages in Local Folders/Review are processed using the **thunderbird-review-ac
 | Tag | Meaning |
 |-----|---------|
 | `tbq_identified` | Message has been processed by the filter chain; prevents re-processing |
-| `copied_to_local` | Message was copied to a Local Folder |
+| `copied_to_local` | Message was copied to a category-specific Local Folder (not set for Review copies) |
 | `trash` | Message is scheduled for deletion after 30 days |
 | `*_processed` | Category-specific idempotency tag (e.g. `financial_processed`, `tutor_processed`) |
 | `$label2` | Thunderbird built-in label (used by Overton rules) |
