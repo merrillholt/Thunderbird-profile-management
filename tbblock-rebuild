@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Rebuild the [TBQ] Blocked domains filter from blocked_domains.txt.
-
-Reads the domain list and rewrites the condition line in each account's
-msgFilterRules.dat. Thunderbird must not be running when this runs.
+"""Apply queued domain block changes to Thunderbird filter files.
 
 Usage:
-  tbblock-rebuild [--dry-run] [--check]
+  tbblock-rebuild           preview changes, prompt, and apply
+  tbblock-rebuild --list    list domains in the current [TBQ] Blocked domains filter
 """
 
 from __future__ import annotations
 
-import argparse
 import configparser
 import re
 import subprocess
@@ -52,22 +49,51 @@ def is_tb_running() -> bool:
     return False
 
 
-def read_domains() -> list[str]:
+def normalize(d: str) -> str:
+    return "@" + d.strip().lstrip("@").lower()
+
+
+def read_queue() -> dict[str, str]:
+    """Parse blocked_domains.txt → {domain: last_action}. Empty dict if no pending entries."""
     if not DOMAINS_FILE.exists():
-        return []
-    seen: set[str] = set()
-    domains: list[str] = []
+        return {}
+    net: dict[str, str] = {}
     for line in DOMAINS_FILE.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if not line.startswith("@"):
-            line = "@" + line
-        line = line.lower()
-        if line not in seen:
-            seen.add(line)
-            domains.append(line)
-    return sorted(domains)
+        parts = line.split(None, 1)
+        if len(parts) != 2 or parts[0] not in ("add", "delete"):
+            continue
+        net[normalize(parts[1])] = parts[0]
+    return net
+
+
+def clear_queue() -> None:
+    DOMAINS_FILE.write_text(
+        "# Pending domain block changes. Managed by tbblock.\n"
+        "# Run tbblock-rebuild to apply. File is cleared after apply.\n"
+    )
+
+
+def parse_blocks(content: str) -> tuple[str, list[str]]:
+    lines = content.splitlines(keepends=True)
+    header_lines: list[str] = []
+    body_start = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith("name="):
+            body_start = i
+            break
+        header_lines.append(line)
+    header = "".join(header_lines)
+    body = "".join(lines[body_start:])
+    raw = re.split(r"(?=^name=)", body, flags=re.MULTILINE)
+    return header, [b for b in raw if b.strip()]
+
+
+def block_name(block: str) -> str:
+    m = re.match(r'^name="([^"]*)"', block)
+    return m.group(1) if m else ""
 
 
 def extract_domains(block: str) -> list[str]:
@@ -78,8 +104,7 @@ def extract_domains(block: str) -> list[str]:
 
 
 def build_condition(domains: list[str]) -> str:
-    parts = [f"(from,contains,{d})" for d in domains]
-    return "OR " + " OR ".join(parts)
+    return "OR " + " OR ".join(f"(from,contains,{d})" for d in domains)
 
 
 def make_filter_block(condition: str) -> str:
@@ -96,98 +121,83 @@ def make_filter_block(condition: str) -> str:
     )
 
 
-def parse_blocks(content: str) -> tuple[str, list[str]]:
-    """Split a msgFilterRules.dat file into (header, [filter_block, ...])."""
-    lines = content.splitlines(keepends=True)
-    header_lines: list[str] = []
-    body_start = len(lines)
-    for i, line in enumerate(lines):
-        if line.startswith("name="):
-            body_start = i
-            break
-        header_lines.append(line)
-    header = "".join(header_lines)
-    body = "".join(lines[body_start:])
-    raw = re.split(r"(?=^name=)", body, flags=re.MULTILINE)
-    blocks = [b for b in raw if b.strip()]
-    return header, blocks
+def get_filter_domains(path: Path) -> set[str]:
+    _, blocks = parse_blocks(path.read_text())
+    idx = next((i for i, b in enumerate(blocks) if block_name(b) == FILTER_NAME), None)
+    return set(extract_domains(blocks[idx])) if idx is not None else set()
 
 
-def block_name(block: str) -> str:
-    m = re.match(r'^name="([^"]*)"', block)
-    return m.group(1) if m else ""
+def write_filter(path: Path, domains: set[str]) -> None:
+    content = path.read_text()
+    header, blocks = parse_blocks(content)
+    idx = next((i for i, b in enumerate(blocks) if block_name(b) == FILTER_NAME), None)
+
+    if not domains:
+        if idx is not None:
+            blocks = [b for b in blocks if block_name(b) != FILTER_NAME]
+        path.write_text(header + "".join(blocks))
+        return
+
+    new_block = make_filter_block(build_condition(sorted(domains)))
+    if idx is not None:
+        blocks[idx] = new_block
+    else:
+        anchor = next((i for i, b in enumerate(blocks) if block_name(b) == INSERT_AFTER), None)
+        if anchor is not None:
+            blocks.insert(anchor + 1, new_block)
+        else:
+            fb = next((i for i, b in enumerate(blocks) if block_name(b) == FALLBACK_BEFORE), None)
+            blocks.insert(fb if fb is not None else len(blocks), new_block)
+    path.write_text(header + "".join(blocks))
 
 
 def dn(n: int) -> str:
     return f"{n} domain{'s' if n != 1 else ''}"
 
 
-def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> tuple[str, list[str]]:
-    """Return (summary_line, detail_lines) where detail_lines are printed indented below."""
-    content = path.read_text()
-    header, blocks = parse_blocks(content)
-
-    existing_idx = next(
-        (i for i, b in enumerate(blocks) if block_name(b) == FILTER_NAME), None
-    )
-    old_domains = extract_domains(blocks[existing_idx]) if existing_idx is not None else []
-
-    if not domains:
-        if existing_idx is None:
-            return "ok — no filter present", []
-        if not dry_run:
-            new_blocks = [b for b in blocks if block_name(b) != FILTER_NAME]
-            path.write_text(header + "".join(new_blocks))
-        return f"removed filter (had {dn(len(old_domains))})", [f"  - {d}" for d in old_domains]
-
-    condition = build_condition(domains)
-    new_block = make_filter_block(condition)
-
-    if existing_idx is not None:
-        if blocks[existing_idx] == new_block:
-            return f"up to date ({dn(len(domains))})", []
-        blocks[existing_idx] = new_block
-        if not dry_run:
-            path.write_text(header + "".join(blocks))
-        old_set, new_set = set(old_domains), set(domains)
-        added = sorted(new_set - old_set)
-        removed = sorted(old_set - new_set)
-        detail = [f"  + {d}" for d in added] + [f"  - {d}" for d in removed]
-        return f"updated ({dn(len(domains))} total)", detail
-
-    anchor = next(
-        (i for i, b in enumerate(blocks) if block_name(b) == INSERT_AFTER), None
-    )
-    if anchor is not None:
-        blocks.insert(anchor + 1, new_block)
-    else:
-        fallback = next(
-            (i for i, b in enumerate(blocks) if block_name(b) == FALLBACK_BEFORE), None
-        )
-        blocks.insert(fallback if fallback is not None else len(blocks), new_block)
-
-    if not dry_run:
-        path.write_text(header + "".join(blocks))
-    return f"filter created ({dn(len(domains))})", []
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dry-run", action="store_true", help="Show changes without writing.")
-    ap.add_argument("--check", action="store_true", help="Exit non-zero if any file would change.")
-    args = ap.parse_args()
-
-    if is_tb_running():
-        print("ERROR: Thunderbird is running — quit it before rebuilding filters.", file=sys.stderr)
+def cmd_list() -> int:
+    try:
+        profile = find_profile()
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    domains = read_domains()
-    if domains:
-        print(f"Block list ({len(domains)}):")
-        for d in domains:
-            print(f"  {d}")
-    else:
-        print("Block list is empty.")
+    filter_files = sorted((profile / "ImapMail").glob("*/msgFilterRules.dat"))
+    if not filter_files:
+        print("No IMAP filter files found.", file=sys.stderr)
+        return 1
+
+    print(f'Current "{FILTER_NAME}" filter:')
+    for path in filter_files:
+        account = path.parent.name
+        domains = sorted(get_filter_domains(path))
+        if domains:
+            print(f"  {account} ({dn(len(domains))}):")
+            for d in domains:
+                print(f"    {d}")
+        else:
+            print(f"  {account}: (no filter)")
+    return 0
+
+
+def cmd_apply() -> int:
+    print(f"Command file: {DOMAINS_FILE}")
+
+    queue = read_queue()
+    if not queue:
+        print("  (empty — no pending changes)")
+        return 0
+
+    net_adds = {d for d, a in queue.items() if a == "add"}
+    net_deletes = {d for d, a in queue.items() if a == "delete"}
+    n_add, n_del = len(net_adds), len(net_deletes)
+    print(f"  Pending: {n_add} add{'s' if n_add != 1 else ''}, "
+          f"{n_del} delete{'s' if n_del != 1 else ''}")
+    print()
+
+    if is_tb_running():
+        print("ERROR: Thunderbird is running — quit it before applying changes.", file=sys.stderr)
+        return 1
 
     try:
         profile = find_profile()
@@ -200,25 +210,90 @@ def main() -> int:
         print("No IMAP filter files found.", file=sys.stderr)
         return 1
 
-    any_change = False
+    # Build unified domain view across all accounts
+    all_current: set[str] = set()
     for path in filter_files:
-        account = path.parent.name
-        summary, detail = update_filter_file(path, domains, dry_run=args.dry_run)
-        changed = not summary.startswith("ok") and not summary.startswith("up to date")
-        flag = " [dry-run]" if args.dry_run and changed else ""
-        print(f"  {account}: {summary}{flag}")
-        for line in detail:
-            print(f"  {line}")
-        if changed:
-            any_change = True
+        all_current |= get_filter_domains(path)
 
-    if args.check and any_change:
+    to_add = sorted(net_adds - all_current)
+    to_delete = sorted(net_deletes & all_current)
+    no_change = sorted(all_current - net_deletes)
+    not_found = sorted(net_deletes - all_current)
+    final_set = (all_current | net_adds) - net_deletes
+
+    # Display plan
+    print(f"No change ({len(no_change)}):")
+    if no_change:
+        for d in no_change:
+            print(f"  {d}")
+    else:
+        print("  (none)")
+
+    print(f"Add ({len(to_add)}):")
+    if to_add:
+        for d in to_add:
+            print(f"  + {d}")
+    else:
+        print("  (none)")
+
+    total_del = len(to_delete) + len(not_found)
+    print(f"Delete ({total_del}):")
+    if to_delete:
+        for d in to_delete:
+            print(f"  - {d}")
+    if not_found:
+        for d in not_found:
+            print(f"  ? {d}  (not in filter — no action)")
+    if not to_delete and not not_found:
+        print("  (none)")
+
+    any_change = bool(to_add or to_delete)
+    print()
+
+    if not any_change:
+        print("No filter changes needed.")
+        clear_queue()
+        return 0
+
+    try:
+        answer = input("Apply these changes? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
         return 1
 
-    if not args.dry_run and any_change:
-        print("Done. Start Thunderbird to load the updated filters.")
+    if answer not in ("y", "yes"):
+        print("Aborted.")
+        return 1
 
+    print()
+    for path in filter_files:
+        write_filter(path, final_set)
+        account = path.parent.name
+        parts = []
+        if to_add:
+            parts.append(f"+{len(to_add)}")
+        if to_delete:
+            parts.append(f"-{len(to_delete)}")
+        print(f"  {account}: updated ({', '.join(parts)}, {dn(len(final_set))} total)")
+
+    clear_queue()
+    print()
+    print("Done. Start Thunderbird to load the updated filters.")
     return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        return cmd_apply()
+    if args[0] in ("--list", "-l"):
+        return cmd_list()
+    if args[0] in ("--help", "-h"):
+        print(__doc__.strip())
+        return 0
+    print(f"Unknown option: {args[0]}", file=sys.stderr)
+    print(__doc__.strip())
+    return 1
 
 
 if __name__ == "__main__":

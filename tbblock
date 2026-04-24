@@ -1,36 +1,43 @@
 #!/usr/bin/env bash
-# Manage the Thunderbird domain block list.
+# Manage the Thunderbird domain block queue.
 #
 # Usage:
-#   tbblock @domain.com            # add a domain
-#   tbblock --delete @domain.com   # remove a domain
-#   tbblock --list                 # list all blocked domains
-#   tbblock --rebuild              # rebuild Thunderbird filters (TB must be closed)
-#   tbblock --help                 # show this help
+#   tbblock --add @domain.com [...]     queue domains to add
+#   tbblock --delete @domain.com [...]  queue domains to delete
+#   tbblock --list                      show pending changes
+#   tbblock --help                      show this help
 #
-# Add/delete can be run while Thunderbird is open. Run --rebuild (or
-# tbblock-rebuild directly) after closing Thunderbird to apply changes.
+# Run tbblock-rebuild to apply queued changes (Thunderbird must be closed).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOMAINS_FILE="$SCRIPT_DIR/blocked_domains.txt"
-REBUILD="$SCRIPT_DIR/tbblock-rebuild"
 
 usage() {
-  cat >&2 <<EOF
-Usage: tbblock @domain.com            add a domain to the block list
-       tbblock --delete @domain.com   remove a domain from the block list
-       tbblock --list                 list all blocked domains
-       tbblock --rebuild              rebuild Thunderbird filters (TB must be closed)
-       tbblock --help                 show this help
+  cat >&2 <<'EOF'
+Usage:
+  tbblock --add @domain.com [...]     queue domains to add
+  tbblock --delete @domain.com [...]  queue domains to delete
+  tbblock --list                      show pending changes
+  tbblock --help                      show this help
+
+Run tbblock-rebuild to apply queued changes (Thunderbird must be closed).
 EOF
   exit 1
 }
 
-normalize_domain() {
+normalize() {
   local d="${1#@}"
-  echo "@${d,,}"
+  printf '@%s\n' "${d,,}"
+}
+
+init_file() {
+  [[ -f "$DOMAINS_FILE" ]] && return
+  cat > "$DOMAINS_FILE" <<'EOF'
+# Pending domain block changes. Managed by tbblock.
+# Run tbblock-rebuild to apply. File is cleared after apply.
+EOF
 }
 
 case "${1:-}" in
@@ -39,50 +46,47 @@ case "${1:-}" in
     ;;
 
   --list|-l)
+    echo "Command file: $DOMAINS_FILE"
     if [[ -f "$DOMAINS_FILE" ]]; then
-      grep -v '^\s*#' "$DOMAINS_FILE" | grep -v '^\s*$' | sort
+      pending="$(grep -Ev '^\s*(#|$)' "$DOMAINS_FILE" 2>/dev/null | sort || true)"
+      if [[ -n "$pending" ]]; then
+        echo "$pending"
+      else
+        echo "  (no pending changes)"
+      fi
+    else
+      echo "  (file not found)"
     fi
-    exit 0
+    ;;
+
+  --add)
+    shift
+    [[ $# -eq 0 ]] && { echo "Error: --add requires at least one domain" >&2; exit 1; }
+    init_file
+    for arg in "$@"; do
+      d="$(normalize "$arg")"
+      echo "add $d" >> "$DOMAINS_FILE"
+      echo "Queued: add $d"
+    done
     ;;
 
   --delete|-d)
-    [[ -z "${2:-}" ]] && usage
-    domain="$(normalize_domain "$2")"
-    if [[ ! -f "$DOMAINS_FILE" ]] || ! grep -qxF "$domain" "$DOMAINS_FILE" 2>/dev/null; then
-      echo "Not in block list: $domain"
-      exit 0
-    fi
-    tmp="$(mktemp)"
-    grep -vxF "$domain" "$DOMAINS_FILE" > "$tmp"
-    mv "$tmp" "$DOMAINS_FILE"
-    echo "Deleted: $domain"
-    ;;
-
-  --rebuild|-r)
-    if [[ ! -x "$REBUILD" ]]; then
-      echo "Error: tbblock-rebuild not found at $REBUILD" >&2
-      exit 1
-    fi
-    "$REBUILD"
+    shift
+    [[ $# -eq 0 ]] && { echo "Error: --delete requires at least one domain" >&2; exit 1; }
+    init_file
+    for arg in "$@"; do
+      d="$(normalize "$arg")"
+      echo "delete $d" >> "$DOMAINS_FILE"
+      echo "Queued: delete $d"
+    done
     ;;
 
   "")
     usage
     ;;
 
-  -*)
+  *)
     echo "Unknown option: $1" >&2
     usage
-    ;;
-
-  *)
-    domain="$(normalize_domain "$1")"
-    touch "$DOMAINS_FILE"
-    if grep -qxF "$domain" "$DOMAINS_FILE" 2>/dev/null; then
-      echo "Already blocked: $domain"
-    else
-      echo "$domain" >> "$DOMAINS_FILE"
-      echo "Added: $domain"
-    fi
     ;;
 esac

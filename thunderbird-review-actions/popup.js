@@ -65,7 +65,7 @@ async function runAction(type) {
                    : sa?.created === false ? " Sender already in Trash Senders."
                    : sa?.error ? ` Sender was not recorded: ${sa.error}`
                    : "";
-    const domainNote = `Run: tbblock ${domain}`;
+    const domainNote = `Run: tbblock --add ${domain}`;
     if (response.inReview) {
       const tagged = response.tagged > 0
         ? "Inbox copy tagged as trash."

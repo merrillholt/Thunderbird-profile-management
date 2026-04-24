@@ -1,0 +1,2 @@
+# Pending domain block changes. Managed by tbblock.
+# Run tbblock-rebuild to apply. File is cleared after apply.
