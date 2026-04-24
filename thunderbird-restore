@@ -434,6 +434,67 @@ else
     file_count=$(find "${dest}" -type f | wc -l)
 fi
 
+# Apply MIME type defaults from backup metadata
+mime_status=""
+if ! "${dry_run}" && ! "${self_test}" && [[ -f "${metadata_src}/xdg-mime-defaults.txt" ]] && command -v xdg-mime &>/dev/null; then
+    mime_applied=0
+    mime_failed=0
+    while IFS='=' read -r mime_type desktop_file; do
+        [[ -z "${mime_type}" || -z "${desktop_file}" ]] && continue
+        if xdg-mime default "${desktop_file}" "${mime_type}" 2>/dev/null; then
+            (( mime_applied++ )) || true
+        else
+            (( mime_failed++ )) || true
+        fi
+    done < "${metadata_src}/xdg-mime-defaults.txt"
+    if (( mime_applied > 0 && mime_failed == 0 )); then
+        mime_status="Applied (${mime_applied} types)"
+    elif (( mime_applied > 0 )); then
+        mime_status="Partial (${mime_applied} applied, ${mime_failed} failed)"
+    else
+        mime_status="Failed"
+    fi
+else
+    mime_status="Skipped"
+fi
+
+# Apply Flatpak sandbox restrictions from backup metadata
+flatpak_status=""
+if ! "${dry_run}" && ! "${self_test}" && [[ "${tb_type}" == "Flatpak" ]] && [[ -f "${metadata_src}/flatpak-override-user.txt" ]]; then
+    # Extract only '!home' and similar negation/restriction entries — skip
+    # source-system-specific path grants (absolute paths starting with /).
+    # The !home entry tightens the sandbox and should be carried over.
+    restrictions=$(grep -oP '(?<=filesystems=)[^;]+(?:;[^;]+)*' "${metadata_src}/flatpak-override-user.txt" 2>/dev/null \
+        | tr ';' '\n' | grep -v '^/' | grep -v '^$' || true)
+    if [[ -n "${restrictions}" ]]; then
+        while IFS= read -r entry; do
+            flatpak override --user org.mozilla.Thunderbird --filesystem="${entry}" 2>/dev/null || true
+        done <<< "${restrictions}"
+        flatpak_status="Applied: ${restrictions//$'\n'/, }"
+    else
+        flatpak_status="Nothing to apply"
+    fi
+elif ! "${dry_run}" && ! "${self_test}" && [[ "${tb_type}" == "Flatpak" ]]; then
+    flatpak_status="Backup metadata not found"
+else
+    flatpak_status="Skipped"
+fi
+
+# Build post-restore checklist
+post_restore_notes=""
+if ! "${dry_run}" && ! "${self_test}"; then
+    post_restore_notes=$(cat <<'NOTES'
+
+  Next steps:
+  1. Start Thunderbird and verify all accounts connect.
+  2. Re-enter account passwords if prompted (system keyring is not
+     included in the profile backup).
+  3. If Thunderbird is Flatpak, verify sandbox permissions:
+       flatpak override --user --show org.mozilla.Thunderbird
+NOTES
+)
+fi
+
 # Report
 report=$(cat <<EOF
 ==============================
@@ -451,6 +512,8 @@ report=$(cat <<EOF
   Total files:        ${file_count}
   Restored size:      ${restored_size}
   Profile size:       ${profile_size}
+  MIME defaults:      ${mime_status}
+  Flatpak sandbox:    ${flatpak_status}
 ==============================
   Restore $("${dry_run}" && echo "(dry run) ")complete.
 ==============================
@@ -459,3 +522,4 @@ EOF
 
 echo "${report}"
 echo "${report}" >> "${log_file}"
+[[ -n "${post_restore_notes}" ]] && echo "${post_restore_notes}"
