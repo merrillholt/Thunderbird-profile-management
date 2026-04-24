@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Manage the Thunderbird domain block list and regenerate filters.
+# Manage the Thunderbird domain block list.
 #
 # Usage:
 #   tbblock @domain.com            # add a domain
-#   tbblock --remove @domain.com   # remove a domain
+#   tbblock --delete @domain.com   # remove a domain
 #   tbblock --list                 # list all blocked domains
+#   tbblock --rebuild              # rebuild Thunderbird filters (TB must be closed)
+#   tbblock --help                 # show this help
 #
-# After adding or removing a domain, the script rebuilds the Thunderbird
-# filters (tbblock-rebuild). Thunderbird must not be running.
+# Add/delete can be run while Thunderbird is open. Run --rebuild (or
+# tbblock-rebuild directly) after closing Thunderbird to apply changes.
 
 set -euo pipefail
 
@@ -16,27 +18,26 @@ DOMAINS_FILE="$SCRIPT_DIR/blocked_domains.txt"
 REBUILD="$SCRIPT_DIR/tbblock-rebuild"
 
 usage() {
-  echo "Usage: tbblock @domain.com" >&2
-  echo "       tbblock --remove @domain.com" >&2
-  echo "       tbblock --list" >&2
+  cat >&2 <<EOF
+Usage: tbblock @domain.com            add a domain to the block list
+       tbblock --delete @domain.com   remove a domain from the block list
+       tbblock --list                 list all blocked domains
+       tbblock --rebuild              rebuild Thunderbird filters (TB must be closed)
+       tbblock --help                 show this help
+EOF
   exit 1
 }
 
 normalize_domain() {
-  local d="${1#@}"        # strip leading @
-  echo "@${d,,}"          # lowercase, re-add @
-}
-
-run_rebuild() {
-  if [[ -x "$REBUILD" ]]; then
-    echo ""
-    "$REBUILD"
-  else
-    echo "Warning: tbblock-rebuild not found at $REBUILD" >&2
-  fi
+  local d="${1#@}"
+  echo "@${d,,}"
 }
 
 case "${1:-}" in
+  --help|-h)
+    usage
+    ;;
+
   --list|-l)
     if [[ -f "$DOMAINS_FILE" ]]; then
       grep -v '^\s*#' "$DOMAINS_FILE" | grep -v '^\s*$' | sort
@@ -44,7 +45,7 @@ case "${1:-}" in
     exit 0
     ;;
 
-  --remove|-r)
+  --delete|-d)
     [[ -z "${2:-}" ]] && usage
     domain="$(normalize_domain "$2")"
     if [[ ! -f "$DOMAINS_FILE" ]] || ! grep -qxF "$domain" "$DOMAINS_FILE" 2>/dev/null; then
@@ -54,8 +55,15 @@ case "${1:-}" in
     tmp="$(mktemp)"
     grep -vxF "$domain" "$DOMAINS_FILE" > "$tmp"
     mv "$tmp" "$DOMAINS_FILE"
-    echo "Removed: $domain"
-    run_rebuild
+    echo "Deleted: $domain"
+    ;;
+
+  --rebuild|-r)
+    if [[ ! -x "$REBUILD" ]]; then
+      echo "Error: tbblock-rebuild not found at $REBUILD" >&2
+      exit 1
+    fi
+    "$REBUILD"
     ;;
 
   "")
@@ -76,6 +84,5 @@ case "${1:-}" in
       echo "$domain" >> "$DOMAINS_FILE"
       echo "Added: $domain"
     fi
-    run_rebuild
     ;;
 esac
