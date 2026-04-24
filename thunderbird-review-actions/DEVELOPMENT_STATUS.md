@@ -1,13 +1,11 @@
 # Development Status
 
-Last updated: 2026-04-20
+Last updated: 2026-04-24
 
 ## Current state
 
-The extension is fully functional and installed as
-`thunderbird-review-actions@merrill.local` in Thunderbird 140.9.1 ESR
-(Flatpak). The packaged XPI, local source, pCloud source, installed profile
-extension, and Thunderbird backup copy were verified to match on 2026-04-20.
+The extension is at version 0.4.0. Source and XPI are in sync. The XPI must
+be re-installed in Thunderbird to pick up the 0.4.0 changes (two trash buttons).
 
 ## Actions
 
@@ -17,12 +15,22 @@ extension, and Thunderbird backup copy were verified to match on 2026-04-20.
   - If the message is a Review folder copy, permanently deletes it (the
     original remains in the Inbox).
 
-- **Mark trash**
+- **Trash sender**
   - Adds the sender to the `Trash Senders` address book if not already present.
   - If in Review: finds Inbox copies by Message-ID, adds the `trash` tag to
     those Inbox copies, and permanently deletes the Review copy.
   - If not in Review: adds the `trash` tag to the current message.
   - Thunderbird filters handle cleanup of trash-tagged messages after 30 days.
+
+- **Trash domain**
+  - Same as Trash sender (per-sender address book entry + trash tag).
+  - Additionally extracts the sender's domain (`@domain.com`) and displays
+    it in the status line as `Run: tbblock @domain.com`.
+  - After quitting Thunderbird, run `tbblock @domain.com` to add the domain to
+    `~/bin/blocked_domains.txt` and rebuild the `[TBQ] Blocked domains` filter
+    in all account filter files. Restart Thunderbird to activate the filter.
+  - The per-sender entry in Trash Senders provides immediate protection for
+    that sender; the domain filter catches all future senders at that domain.
 
 - **Mark junk**
   - If in Review: finds Inbox copies by Message-ID, marks them as junk,
@@ -86,9 +94,30 @@ causing Thunderbird to start with a new empty profile.
 - A verified backup was written to `/mnt/pcloud/Thunderbird Backup` on
   2026-04-20 at 12:00:15.
 
+## Domain blocking CLI (`tbblock`, `tbblock-rebuild`)
+
+Two scripts in `thunderbird-tools/` manage the `[TBQ] Blocked domains -> Trash`
+filter. The filter is inserted after `[TBQ] Trash senders -> Trash` and before
+`[TBQ] Spoofed trusted domains -> Spoofed`, so the whitelist still wins for
+false-positive recovery.
+
+```
+tbblock @domain.com          # add a domain and rebuild filters
+tbblock --remove @domain.com # remove a domain and rebuild filters
+tbblock --list               # list all blocked domains
+tbblock-rebuild --dry-run    # preview changes without writing
+```
+
+Canonical source: `~/bin/blocked_domains.txt` (one `@domain.com` per line).
+Thunderbird must be closed when `tbblock-rebuild` runs; it checks and errors
+if TB is running.
+
 ## Remaining work
 
 - Verify whether `messages.update({ junk: true })` triggers Bayesian training.
 - Optional: add an explicit "requeue/clear review" action that removes
   `tbq_identified` from the Inbox copy before deleting the Review copy.
 - Optional: add an export/audit command for `Whitelist` and `Trash Senders`.
+- Optional: add native messaging host so "Trash domain" can write to
+  `blocked_domains.txt` directly from the extension (requires Flatpak sandbox
+  filesystem grant and a native host manifest).

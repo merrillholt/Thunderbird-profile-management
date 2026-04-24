@@ -225,6 +225,49 @@ async function markTrash() {
   };
 }
 
+async function markTrashDomain() {
+  const message = await getCurrentMessage();
+  const email = extractEmailAddress(message.author);
+  const domain = "@" + email.split("@")[1];
+  const reviewFolder = await getReviewFolderFor(message.id, message.headerMessageId);
+
+  let senderAdded = null;
+  try {
+    senderAdded = await ensureInTrashSenders(email, message.author);
+  } catch (e) {
+    senderAdded = { error: e instanceof Error ? e.message : String(e) };
+  }
+
+  if (reviewFolder) {
+    const others = await findInboxCopies(message.headerMessageId, message.id);
+    let tagged = 0;
+    for (const other of others) {
+      if (await addTag(other.id, CONFIG.trashTag)) {
+        tagged++;
+      }
+    }
+    await deleteAndAdvance(message.id, reviewFolder);
+    return {
+      ok: true,
+      action: "mark-trash-domain",
+      domain,
+      inReview: true,
+      tagged,
+      senderAdded
+    };
+  }
+
+  const tagged = await addTag(message.id, CONFIG.trashTag);
+  return {
+    ok: true,
+    action: "mark-trash-domain",
+    domain,
+    inReview: false,
+    tagged,
+    senderAdded
+  };
+}
+
 async function markJunk() {
   const message = await getCurrentMessage();
   const reviewFolder = await getReviewFolderFor(message.id, message.headerMessageId);
@@ -274,6 +317,10 @@ messenger.runtime.onMessage.addListener(async request => {
 
     if (request?.type === "mark-trash") {
       return await markTrash();
+    }
+
+    if (request?.type === "mark-trash-domain") {
+      return await markTrashDomain();
     }
 
     if (request?.type === "mark-junk") {

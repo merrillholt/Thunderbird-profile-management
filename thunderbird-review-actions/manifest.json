@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Thunderbird Review Actions",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Approve senders from the Review folder by adding them to the Whitelist address book, or tag messages for later trash cleanup.",
   "browser_specific_settings": {
     "gecko": {

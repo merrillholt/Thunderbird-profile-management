@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Rebuild the [TBQ] Blocked domains filter from ~/bin/blocked_domains.txt.
+
+Reads the domain list and rewrites the condition line in each account's
+msgFilterRules.dat. Thunderbird must not be running when this runs.
+
+Usage:
+  tbblock-rebuild [--dry-run] [--check]
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DOMAINS_FILE = Path(__file__).resolve().parent / "blocked_domains.txt"
+FLATPAK_TB_DIR = Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird"
+FILTER_NAME = "[TBQ] Blocked domains -> Trash"
+INSERT_AFTER = "[TBQ] Trash senders -> Trash"
+FALLBACK_BEFORE = "[TBQ] Spoofed trusted domains -> Spoofed"
+
+
+def find_profile() -> Path:
+    ini = FLATPAK_TB_DIR / "profiles.ini"
+    if ini.exists():
+        cp = configparser.ConfigParser()
+        cp.read(ini)
+        for section in cp.sections():
+            if cp.get(section, "default", fallback="") == "1":
+                rel = cp.get(section, "path", fallback="")
+                if rel:
+                    is_relative = cp.get(section, "isrelative", fallback="1") == "1"
+                    return FLATPAK_TB_DIR / rel if is_relative else Path(rel)
+    candidates = sorted(FLATPAK_TB_DIR.glob("*.default*"))
+    if candidates:
+        return candidates[0]
+    raise RuntimeError(f"No Thunderbird profile found in {FLATPAK_TB_DIR}")
+
+
+def is_tb_running() -> bool:
+    for pattern in ("org.mozilla.Thunderbird", "thunderbird-bin", "thunderbird"):
+        try:
+            r = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
+            if r.returncode == 0:
+                return True
+        except FileNotFoundError:
+            pass
+    return False
+
+
+def read_domains() -> list[str]:
+    if not DOMAINS_FILE.exists():
+        return []
+    seen: set[str] = set()
+    domains: list[str] = []
+    for line in DOMAINS_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("@"):
+            line = "@" + line
+        line = line.lower()
+        if line not in seen:
+            seen.add(line)
+            domains.append(line)
+    return sorted(domains)
+
+
+def build_condition(domains: list[str]) -> str:
+    parts = [f"(from,contains,{d})" for d in domains]
+    return "OR " + " OR ".join(parts)
+
+
+def make_filter_block(condition: str) -> str:
+    return (
+        f'name="{FILTER_NAME}"\n'
+        f'enabled="yes"\n'
+        f'type="17"\n'
+        f'action="AddTag"\n'
+        f'actionValue="trash"\n'
+        f'action="AddTag"\n'
+        f'actionValue="tbq_identified"\n'
+        f'action="Stop execution"\n'
+        f'condition="{condition}"\n'
+    )
+
+
+def parse_blocks(content: str) -> tuple[str, list[str]]:
+    """Split a msgFilterRules.dat file into (header, [filter_block, ...])."""
+    lines = content.splitlines(keepends=True)
+    header_lines: list[str] = []
+    body_start = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith("name="):
+            body_start = i
+            break
+        header_lines.append(line)
+    header = "".join(header_lines)
+    body = "".join(lines[body_start:])
+    # Split at each line that begins a new filter (lookahead preserves delimiter)
+    raw = re.split(r"(?=^name=)", body, flags=re.MULTILINE)
+    blocks = [b for b in raw if b.strip()]
+    return header, blocks
+
+
+def block_name(block: str) -> str:
+    m = re.match(r'^name="([^"]*)"', block)
+    return m.group(1) if m else ""
+
+
+def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> str:
+    content = path.read_text()
+    header, blocks = parse_blocks(content)
+
+    if not domains:
+        new_blocks = [b for b in blocks if block_name(b) != FILTER_NAME]
+        if len(new_blocks) == len(blocks):
+            return "no-op"
+        if not dry_run:
+            path.write_text(header + "".join(new_blocks))
+        return "removed (empty domain list)"
+
+    condition = build_condition(domains)
+    new_block = make_filter_block(condition)
+
+    existing_idx = next(
+        (i for i, b in enumerate(blocks) if block_name(b) == FILTER_NAME), None
+    )
+
+    if existing_idx is not None:
+        if blocks[existing_idx] == new_block:
+            return "no-op"
+        blocks[existing_idx] = new_block
+        if not dry_run:
+            path.write_text(header + "".join(blocks))
+        return "updated"
+
+    # Insert after the Trash senders filter; fall back to before Spoofed domains
+    anchor = next(
+        (i for i, b in enumerate(blocks) if block_name(b) == INSERT_AFTER), None
+    )
+    if anchor is not None:
+        blocks.insert(anchor + 1, new_block)
+    else:
+        fallback = next(
+            (i for i, b in enumerate(blocks) if block_name(b) == FALLBACK_BEFORE), None
+        )
+        blocks.insert(fallback if fallback is not None else len(blocks), new_block)
+
+    if not dry_run:
+        path.write_text(header + "".join(blocks))
+    return "inserted"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true", help="Show changes without writing.")
+    ap.add_argument("--check", action="store_true", help="Exit non-zero if any file would change.")
+    args = ap.parse_args()
+
+    if is_tb_running():
+        print("ERROR: Thunderbird is running — quit it before rebuilding filters.", file=sys.stderr)
+        return 1
+
+    domains = read_domains()
+    if domains:
+        print(f"Block list ({len(domains)}): {', '.join(domains)}")
+    else:
+        print("Block list is empty — removing filter if present.")
+
+    try:
+        profile = find_profile()
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    filter_files = sorted((profile / "ImapMail").glob("*/msgFilterRules.dat"))
+    if not filter_files:
+        print("No IMAP filter files found.", file=sys.stderr)
+        return 1
+
+    any_change = False
+    for path in filter_files:
+        account = path.parent.name
+        result = update_filter_file(path, domains, dry_run=args.dry_run)
+        flag = " [dry-run]" if args.dry_run and result != "no-op" else ""
+        print(f"  {account}: {result}{flag}")
+        if result != "no-op":
+            any_change = True
+
+    if args.check and any_change:
+        return 1
+
+    if not args.dry_run and any_change:
+        print("Done. Start Thunderbird to load the updated filters.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

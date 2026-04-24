@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Manage the Thunderbird domain block list and regenerate filters.
+#
+# Usage:
+#   tbblock @domain.com            # add a domain
+#   tbblock --remove @domain.com   # remove a domain
+#   tbblock --list                 # list all blocked domains
+#
+# After adding or removing a domain, the script rebuilds the Thunderbird
+# filters (tbblock-rebuild). Thunderbird must not be running.
+
+set -euo pipefail
+
+DOMAINS_FILE="$SCRIPT_DIR/blocked_domains.txt"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REBUILD="$SCRIPT_DIR/tbblock-rebuild"
+
+usage() {
+  echo "Usage: tbblock @domain.com" >&2
+  echo "       tbblock --remove @domain.com" >&2
+  echo "       tbblock --list" >&2
+  exit 1
+}
+
+normalize_domain() {
+  local d="${1#@}"        # strip leading @
+  echo "@${d,,}"          # lowercase, re-add @
+}
+
+run_rebuild() {
+  if [[ -x "$REBUILD" ]]; then
+    echo ""
+    "$REBUILD"
+  else
+    echo "Warning: tbblock-rebuild not found at $REBUILD" >&2
+  fi
+}
+
+case "${1:-}" in
+  --list|-l)
+    if [[ -f "$DOMAINS_FILE" ]]; then
+      grep -v '^\s*#' "$DOMAINS_FILE" | grep -v '^\s*$' | sort
+    fi
+    exit 0
+    ;;
+
+  --remove|-r)
+    [[ -z "${2:-}" ]] && usage
+    domain="$(normalize_domain "$2")"
+    if [[ ! -f "$DOMAINS_FILE" ]] || ! grep -qxF "$domain" "$DOMAINS_FILE" 2>/dev/null; then
+      echo "Not in block list: $domain"
+      exit 0
+    fi
+    tmp="$(mktemp)"
+    grep -vxF "$domain" "$DOMAINS_FILE" > "$tmp"
+    mv "$tmp" "$DOMAINS_FILE"
+    echo "Removed: $domain"
+    run_rebuild
+    ;;
+
+  "")
+    usage
+    ;;
+
+  -*)
+    echo "Unknown option: $1" >&2
+    usage
+    ;;
+
+  *)
+    domain="$(normalize_domain "$1")"
+    touch "$DOMAINS_FILE"
+    if grep -qxF "$domain" "$DOMAINS_FILE" 2>/dev/null; then
+      echo "Already blocked: $domain"
+    else
+      echo "$domain" >> "$DOMAINS_FILE"
+      echo "Added: $domain"
+    fi
+    run_rebuild
+    ;;
+esac
