@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-DOMAINS_FILE="$SCRIPT_DIR/blocked_domains.txt"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOMAINS_FILE="$SCRIPT_DIR/blocked_domains.txt"
 REBUILD="$SCRIPT_DIR/tbblock-rebuild"
 
 usage() {
