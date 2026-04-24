@@ -119,10 +119,10 @@ def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> str:
     if not domains:
         new_blocks = [b for b in blocks if block_name(b) != FILTER_NAME]
         if len(new_blocks) == len(blocks):
-            return "no-op"
+            return "ok (no filter to remove)"
         if not dry_run:
             path.write_text(header + "".join(new_blocks))
-        return "removed (empty domain list)"
+        return "removed"
 
     condition = build_condition(domains)
     new_block = make_filter_block(condition)
@@ -133,7 +133,7 @@ def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> str:
 
     if existing_idx is not None:
         if blocks[existing_idx] == new_block:
-            return "no-op"
+            return "ok (up to date)"
         blocks[existing_idx] = new_block
         if not dry_run:
             path.write_text(header + "".join(blocks))
@@ -170,7 +170,7 @@ def main() -> int:
     if domains:
         print(f"Block list ({len(domains)}): {', '.join(domains)}")
     else:
-        print("Block list is empty — removing filter if present.")
+        print("Block list is empty.")
 
     try:
         profile = find_profile()
@@ -187,9 +187,10 @@ def main() -> int:
     for path in filter_files:
         account = path.parent.name
         result = update_filter_file(path, domains, dry_run=args.dry_run)
-        flag = " [dry-run]" if args.dry_run and result != "no-op" else ""
+        changed = result not in ("ok (no filter to remove)", "ok (up to date)")
+        flag = " [dry-run]" if args.dry_run and changed else ""
         print(f"  {account}: {result}{flag}")
-        if result != "no-op":
+        if changed:
             any_change = True
 
     if args.check and any_change:
