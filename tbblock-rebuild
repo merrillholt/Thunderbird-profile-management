@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild the [TBQ] Blocked domains filter from ~/bin/blocked_domains.txt.
+"""Rebuild the [TBQ] Blocked domains filter from blocked_domains.txt.
 
 Reads the domain list and rewrites the condition line in each account's
 msgFilterRules.dat. Thunderbird must not be running when this runs.
@@ -70,6 +70,13 @@ def read_domains() -> list[str]:
     return sorted(domains)
 
 
+def extract_domains(block: str) -> list[str]:
+    m = re.search(r'^condition="(.+)"', block, re.MULTILINE)
+    if not m:
+        return []
+    return sorted(re.findall(r'\(from,contains,([^)]+)\)', m.group(1)))
+
+
 def build_condition(domains: list[str]) -> str:
     parts = [f"(from,contains,{d})" for d in domains]
     return "OR " + " OR ".join(parts)
@@ -101,7 +108,6 @@ def parse_blocks(content: str) -> tuple[str, list[str]]:
         header_lines.append(line)
     header = "".join(header_lines)
     body = "".join(lines[body_start:])
-    # Split at each line that begins a new filter (lookahead preserves delimiter)
     raw = re.split(r"(?=^name=)", body, flags=re.MULTILINE)
     blocks = [b for b in raw if b.strip()]
     return header, blocks
@@ -112,34 +118,43 @@ def block_name(block: str) -> str:
     return m.group(1) if m else ""
 
 
-def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> str:
+def dn(n: int) -> str:
+    return f"{n} domain{'s' if n != 1 else ''}"
+
+
+def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> tuple[str, list[str]]:
+    """Return (summary_line, detail_lines) where detail_lines are printed indented below."""
     content = path.read_text()
     header, blocks = parse_blocks(content)
-
-    if not domains:
-        new_blocks = [b for b in blocks if block_name(b) != FILTER_NAME]
-        if len(new_blocks) == len(blocks):
-            return "ok (no filter to remove)"
-        if not dry_run:
-            path.write_text(header + "".join(new_blocks))
-        return "removed"
-
-    condition = build_condition(domains)
-    new_block = make_filter_block(condition)
 
     existing_idx = next(
         (i for i, b in enumerate(blocks) if block_name(b) == FILTER_NAME), None
     )
+    old_domains = extract_domains(blocks[existing_idx]) if existing_idx is not None else []
+
+    if not domains:
+        if existing_idx is None:
+            return "ok — no filter present", []
+        if not dry_run:
+            new_blocks = [b for b in blocks if block_name(b) != FILTER_NAME]
+            path.write_text(header + "".join(new_blocks))
+        return f"removed filter (had {dn(len(old_domains))})", [f"  - {d}" for d in old_domains]
+
+    condition = build_condition(domains)
+    new_block = make_filter_block(condition)
 
     if existing_idx is not None:
         if blocks[existing_idx] == new_block:
-            return "ok (up to date)"
+            return f"up to date ({dn(len(domains))})", []
         blocks[existing_idx] = new_block
         if not dry_run:
             path.write_text(header + "".join(blocks))
-        return "updated"
+        old_set, new_set = set(old_domains), set(domains)
+        added = sorted(new_set - old_set)
+        removed = sorted(old_set - new_set)
+        detail = [f"  + {d}" for d in added] + [f"  - {d}" for d in removed]
+        return f"updated ({dn(len(domains))} total)", detail
 
-    # Insert after the Trash senders filter; fall back to before Spoofed domains
     anchor = next(
         (i for i, b in enumerate(blocks) if block_name(b) == INSERT_AFTER), None
     )
@@ -153,7 +168,7 @@ def update_filter_file(path: Path, domains: list[str], dry_run: bool) -> str:
 
     if not dry_run:
         path.write_text(header + "".join(blocks))
-    return "inserted"
+    return f"filter created ({dn(len(domains))})", []
 
 
 def main() -> int:
@@ -168,7 +183,9 @@ def main() -> int:
 
     domains = read_domains()
     if domains:
-        print(f"Block list ({len(domains)}): {', '.join(domains)}")
+        print(f"Block list ({len(domains)}):")
+        for d in domains:
+            print(f"  {d}")
     else:
         print("Block list is empty.")
 
@@ -186,10 +203,12 @@ def main() -> int:
     any_change = False
     for path in filter_files:
         account = path.parent.name
-        result = update_filter_file(path, domains, dry_run=args.dry_run)
-        changed = result not in ("ok (no filter to remove)", "ok (up to date)")
+        summary, detail = update_filter_file(path, domains, dry_run=args.dry_run)
+        changed = not summary.startswith("ok") and not summary.startswith("up to date")
         flag = " [dry-run]" if args.dry_run and changed else ""
-        print(f"  {account}: {result}{flag}")
+        print(f"  {account}: {summary}{flag}")
+        for line in detail:
+            print(f"  {line}")
         if changed:
             any_change = True
 
