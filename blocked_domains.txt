@@ -1,2 +1,23 @@
 # Pending domain block changes. Managed by tbblock.
 # Run tbblock-rebuild to apply. File is cleared after apply.
+add @akoiaswim.com
+add @digital.costco.com
+add @eff.org
+add @email.informeddelivery.usps.com
+add @email.totalwine.com
+add @hello.qobuz.com
+add @homebrewtalk.com
+add @kyivindependent.com
+add @mynissanleaf.com
+add @neurosciencenews.com
+add @onefitnesscompany.com
+add @patch.com
+add @pm-email.gibson.com
+add @reply.nextdoor.com
+add @reuters.com
+add @sfgate.com
+add @smartnewinsure.com
+add @ss.email.nextdoor.com
+add @thomsonreuters.com
+add @update.educationalguidanceforyou.com
+add @visualcapitalist.com
