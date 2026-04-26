@@ -26,12 +26,25 @@ def find_profile() -> Path:
     if ini.exists():
         cp = configparser.ConfigParser()
         cp.read(ini)
+
+        def resolve(rel: str, is_relative: bool) -> Path:
+            return FLATPAK_TB_DIR / rel if is_relative else Path(rel)
+
+        # [Install*] sections reflect the per-install active profile; check these first.
+        for section in cp.sections():
+            if section.startswith("Install"):
+                rel = cp.get(section, "default", fallback="")
+                if rel:
+                    return resolve(rel, is_relative=True)
+
+        # Fall back to the profile with Default=1.
         for section in cp.sections():
             if cp.get(section, "default", fallback="") == "1":
                 rel = cp.get(section, "path", fallback="")
                 if rel:
                     is_relative = cp.get(section, "isrelative", fallback="1") == "1"
-                    return FLATPAK_TB_DIR / rel if is_relative else Path(rel)
+                    return resolve(rel, is_relative)
+
     candidates = sorted(FLATPAK_TB_DIR.glob("*.default*"))
     if candidates:
         return candidates[0]
