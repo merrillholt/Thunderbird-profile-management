@@ -6,6 +6,9 @@
 # Logs
 *.log
 
+# Transient queue state — created and cleared by tbblock/tbblock-rebuild
+blocked_domains.txt
+
 # Python
 __pycache__/
 *.pyc

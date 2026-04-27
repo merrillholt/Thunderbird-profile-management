@@ -328,6 +328,11 @@ else
         flatpak list --app --columns=application,branch,origin,installation,version > "${metadata_dest}/flatpak-apps.txt" 2>&1 || true
         flatpak list --runtime --columns=application,branch,origin,installation,version > "${metadata_dest}/flatpak-runtimes.txt" 2>&1 || true
         flatpak permissions > "${metadata_dest}/flatpak-portal-permissions.txt" 2>&1 || true
+        nm_src="${HOME}/.mozilla/native-messaging-hosts"
+        if [[ -d "${nm_src}" ]]; then
+            mkdir -p "${metadata_dest}/native-messaging-hosts"
+            cp -a "${nm_src}/." "${metadata_dest}/native-messaging-hosts/"
+        fi
     fi
     if command -v xdg-mime >/dev/null 2>&1; then
         {

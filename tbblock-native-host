@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Native messaging host for thunderbird-review-actions.
+
+Queues domain block changes on behalf of the extension by appending to
+blocked_domains.txt, using the same format tbblock produces.
+
+Protocol: WebExtension native messaging — each message is a 4-byte
+little-endian uint32 length prefix followed by UTF-8 JSON.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import sys
+from pathlib import Path
+
+DOMAINS_FILE = Path(__file__).resolve().parent / "blocked_domains.txt"
+
+
+def read_message() -> dict | None:
+    raw_len = sys.stdin.buffer.read(4)
+    if len(raw_len) < 4:
+        return None
+    (length,) = struct.unpack("<I", raw_len)
+    data = sys.stdin.buffer.read(length)
+    if len(data) < length:
+        return None
+    return json.loads(data.decode("utf-8"))
+
+
+def write_message(msg: dict) -> None:
+    data = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(data)))
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+def normalize(d: str) -> str:
+    return "@" + d.strip().lstrip("@").lower()
+
+
+def init_file() -> None:
+    if not DOMAINS_FILE.exists():
+        DOMAINS_FILE.write_text(
+            "# Pending domain block changes. Managed by tbblock.\n"
+            "# Run tbblock-rebuild to apply. File is cleared after apply.\n"
+        )
+
+
+def handle(msg: dict) -> dict:
+    msg_type = msg.get("type", "")
+
+    if msg_type == "tbblock-add":
+        raw = msg.get("domain", "")
+        if not raw:
+            return {"ok": False, "error": "missing domain"}
+        domain = normalize(raw)
+        init_file()
+        with DOMAINS_FILE.open("a") as f:
+            f.write(f"add {domain}\n")
+        return {"ok": True, "message": f"Queued: add {domain}"}
+
+    if msg_type == "tbblock-delete":
+        raw = msg.get("domain", "")
+        if not raw:
+            return {"ok": False, "error": "missing domain"}
+        domain = normalize(raw)
+        init_file()
+        with DOMAINS_FILE.open("a") as f:
+            f.write(f"delete {domain}\n")
+        return {"ok": True, "message": f"Queued: delete {domain}"}
+
+    if msg_type == "tbblock-route":
+        raw = msg.get("domain", "")
+        folder = msg.get("folder", "").strip()
+        if not raw:
+            return {"ok": False, "error": "missing domain"}
+        if not folder:
+            return {"ok": False, "error": "missing folder"}
+        domain = normalize(raw)
+        init_file()
+        with DOMAINS_FILE.open("a") as f:
+            f.write(f"route {domain} {folder}\n")
+        return {"ok": True, "message": f"Queued: route {domain} -> {folder}"}
+
+    if msg_type == "tbblock-unroute":
+        raw = msg.get("domain", "")
+        if not raw:
+            return {"ok": False, "error": "missing domain"}
+        domain = normalize(raw)
+        init_file()
+        with DOMAINS_FILE.open("a") as f:
+            f.write(f"unroute {domain}\n")
+        return {"ok": True, "message": f"Queued: unroute {domain}"}
+
+    if msg_type == "tbblock-list":
+        if not DOMAINS_FILE.exists():
+            return {"ok": True, "entries": []}
+        entries: list[dict] = []
+        for line in DOMAINS_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0] in ("add", "delete", "unroute"):
+                entries.append({"action": parts[0], "domain": parts[1]})
+            elif len(parts) == 3 and parts[0] == "route":
+                entries.append({"action": parts[0], "domain": parts[1], "folder": parts[2]})
+        return {"ok": True, "entries": entries}
+
+    return {"ok": False, "error": f"unknown message type: {msg_type!r}"}
+
+
+def main() -> None:
+    while True:
+        msg = read_message()
+        if msg is None:
+            break
+        try:
+            response = handle(msg)
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+        write_message(response)
+
+
+if __name__ == "__main__":
+    main()

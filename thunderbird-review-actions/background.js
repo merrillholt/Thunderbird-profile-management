@@ -225,6 +225,32 @@ async function markTrash() {
   };
 }
 
+async function getLocalFolders() {
+  const accounts = await messenger.accounts.list();
+  const localAccount = accounts.find(a => a.type === "none");
+  if (!localAccount) return [];
+  const folders = await messenger.folders.query({ accountId: localAccount.id });
+  const skip = new Set(["trash", "junk", "drafts", "sent", "outbox", "templates"]);
+  return folders
+    .filter(f => !skip.has(f.type || ""))
+    .map(f => ({ name: f.name, path: f.path }));
+}
+
+async function queueDomainBlock(domain) {
+  try {
+    const response = await messenger.runtime.sendNativeMessage("tbblock", {
+      type: "tbblock-add",
+      domain
+    });
+    if (response?.ok) {
+      return { queued: true };
+    }
+    return { queued: false, queueError: response?.error || "Native host returned failure" };
+  } catch (e) {
+    return { queued: false, queueError: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 async function markTrashDomain() {
   const message = await getCurrentMessage();
   const email = extractEmailAddress(message.author);
@@ -237,6 +263,8 @@ async function markTrashDomain() {
   } catch (e) {
     senderAdded = { error: e instanceof Error ? e.message : String(e) };
   }
+
+  const queueResult = await queueDomainBlock(domain);
 
   if (reviewFolder) {
     const others = await findInboxCopies(message.headerMessageId, message.id);
@@ -253,7 +281,8 @@ async function markTrashDomain() {
       domain,
       inReview: true,
       tagged,
-      senderAdded
+      senderAdded,
+      ...queueResult
     };
   }
 
@@ -264,8 +293,34 @@ async function markTrashDomain() {
     domain,
     inReview: false,
     tagged,
-    senderAdded
+    senderAdded,
+    ...queueResult
   };
+}
+
+async function routeDomain(folderName) {
+  const message = await getCurrentMessage();
+  const email = extractEmailAddress(message.author);
+  const domain = "@" + email.split("@")[1];
+
+  let queued = false;
+  let queueError = null;
+  try {
+    const response = await messenger.runtime.sendNativeMessage("tbblock", {
+      type: "tbblock-route",
+      domain,
+      folder: folderName
+    });
+    if (response?.ok) {
+      queued = true;
+    } else {
+      queueError = response?.error || "Native host returned failure";
+    }
+  } catch (e) {
+    queueError = e instanceof Error ? e.message : String(e);
+  }
+
+  return { ok: true, action: "route-domain", domain, folder: folderName, queued, queueError };
 }
 
 async function markJunk() {
@@ -325,6 +380,16 @@ messenger.runtime.onMessage.addListener(async request => {
 
     if (request?.type === "mark-junk") {
       return await markJunk();
+    }
+
+    if (request?.type === "get-local-folders") {
+      const folders = await getLocalFolders();
+      return { ok: true, folders };
+    }
+
+    if (request?.type === "route-domain") {
+      if (!request.folder) return { ok: false, error: "No folder specified" };
+      return await routeDomain(request.folder);
     }
 
     return {

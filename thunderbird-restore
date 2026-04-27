@@ -480,6 +480,42 @@ else
     flatpak_status="Skipped"
 fi
 
+# Restore native messaging hosts
+nm_host_status=""
+nm_host_src="${metadata_src}/native-messaging-hosts"
+if ! "${dry_run}" && ! "${self_test}" && [[ -d "${nm_host_src}" ]]; then
+    if [[ "${tb_type}" == "Flatpak" ]]; then
+        nm_host_dest="${HOME}/.mozilla/native-messaging-hosts"
+        mkdir -p "${nm_host_dest}"
+        cp -a "${nm_host_src}/." "${nm_host_dest}/"
+        nm_count=$(find "${nm_host_src}" -maxdepth 1 -name "*.json" | wc -l)
+        nm_host_status="Restored ${nm_count} manifest(s) to ${nm_host_dest}"
+        # Grant sandbox read access to the manifest directory (overrides !home).
+        flatpak override --user org.mozilla.Thunderbird \
+            --filesystem="${nm_host_dest}:ro" 2>/dev/null || true
+        # Grant sandbox access to each host script directory that exists.
+        while IFS= read -r manifest_path; do
+            host_script=$(python3 -c "
+import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get('path',''))
+except Exception:
+    pass
+" "${manifest_path}" 2>/dev/null || true)
+            host_dir=$(dirname "${host_script}" 2>/dev/null || true)
+            if [[ -n "${host_script}" && -d "${host_dir}" ]]; then
+                flatpak override --user org.mozilla.Thunderbird \
+                    --filesystem="${host_dir}" 2>/dev/null || true
+                nm_host_status="${nm_host_status}; override applied for ${host_dir}"
+            fi
+        done < <(find "${nm_host_src}" -maxdepth 1 -name "*.json")
+    else
+        nm_host_status="Skipped (not Flatpak)"
+    fi
+else
+    nm_host_status="Skipped"
+fi
+
 # Build post-restore checklist
 post_restore_notes=""
 if ! "${dry_run}" && ! "${self_test}"; then
@@ -491,6 +527,8 @@ if ! "${dry_run}" && ! "${self_test}"; then
      included in the profile backup).
   3. If Thunderbird is Flatpak, verify sandbox permissions:
        flatpak override --user --show org.mozilla.Thunderbird
+  4. If native messaging hosts were not restored (e.g. first install),
+     run: install-native-host
 NOTES
 )
 fi
@@ -514,6 +552,7 @@ report=$(cat <<EOF
   Profile size:       ${profile_size}
   MIME defaults:      ${mime_status}
   Flatpak sandbox:    ${flatpak_status}
+  Native msg hosts:   ${nm_host_status}
 ==============================
   Restore $("${dry_run}" && echo "(dry run) ")complete.
 ==============================

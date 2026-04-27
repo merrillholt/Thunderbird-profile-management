@@ -15,16 +15,17 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 DOMAINS_FILE="$SCRIPT_DIR/blocked_domains.txt"
 
 usage() {
-  cat >&2 <<'EOF'
+  cat <<'EOF'
 Usage:
-  tbblock --add @domain.com [...]     queue domains to add
-  tbblock --delete @domain.com [...]  queue domains to delete
-  tbblock --list                      show pending changes
-  tbblock --help                      show this help
+  tbblock --add @domain.com [...]           queue domains to block
+  tbblock --delete @domain.com [...]        queue domains to unblock
+  tbblock --route @domain.com FolderName    queue domain-to-folder routing
+  tbblock --unroute @domain.com             queue removal of domain routing
+  tbblock --list                            show pending changes
+  tbblock --help                            show this help
 
 Run tbblock-rebuild to apply queued changes (Thunderbird must be closed).
 EOF
-  exit 1
 }
 
 normalize() {
@@ -43,6 +44,7 @@ EOF
 case "${1:-}" in
   --help|-h)
     usage
+    exit 0
     ;;
 
   --list|-l)
@@ -81,12 +83,35 @@ case "${1:-}" in
     done
     ;;
 
+  --route)
+    shift
+    [[ $# -lt 2 ]] && { echo "Error: --route requires a domain and folder name" >&2; exit 1; }
+    d="$(normalize "$1")"
+    folder="$2"
+    init_file
+    echo "route $d $folder" >> "$DOMAINS_FILE"
+    echo "Queued: route $d -> $folder"
+    ;;
+
+  --unroute)
+    shift
+    [[ $# -eq 0 ]] && { echo "Error: --unroute requires at least one domain" >&2; exit 1; }
+    init_file
+    for arg in "$@"; do
+      d="$(normalize "$arg")"
+      echo "unroute $d" >> "$DOMAINS_FILE"
+      echo "Queued: unroute $d"
+    done
+    ;;
+
   "")
-    usage
+    usage >&2
+    exit 1
     ;;
 
   *)
     echo "Unknown option: $1" >&2
-    usage
+    usage >&2
+    exit 1
     ;;
 esac

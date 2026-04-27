@@ -50,6 +50,23 @@
       .error {
         color: #b00020;
       }
+
+      #route-picker {
+        display: none;
+        gap: 4px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      #route-picker select {
+        flex: 1;
+        font: inherit;
+        padding: 4px;
+      }
+
+      #route-picker button {
+        padding: 4px 8px;
+      }
     </style>
   </head>
   <body>
@@ -60,6 +77,12 @@
       <button id="approve" type="button">Approve sender</button>
       <button id="trash-sender" type="button">Trash sender</button>
       <button id="trash-domain" type="button">Trash domain</button>
+      <button id="route-domain" type="button">Route domain to folder →</button>
+      <div id="route-picker">
+        <select id="folder-select" aria-label="Target folder"></select>
+        <button id="route-apply" type="button">Route</button>
+        <button id="route-cancel" type="button">Cancel</button>
+      </div>
       <button id="junk" type="button">Mark junk</button>
     </div>
     <div id="status" aria-live="polite"></div>
