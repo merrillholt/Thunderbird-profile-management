@@ -41,6 +41,14 @@ init_file() {
 EOF
 }
 
+queue_write() {
+  (
+    flock -x 9
+    init_file
+    echo "$1" >> "$DOMAINS_FILE"
+  ) 9>"${DOMAINS_FILE}.lock"
+}
+
 case "${1:-}" in
   --help|-h)
     usage
@@ -64,10 +72,9 @@ case "${1:-}" in
   --add)
     shift
     [[ $# -eq 0 ]] && { echo "Error: --add requires at least one domain" >&2; exit 1; }
-    init_file
     for arg in "$@"; do
       d="$(normalize "$arg")"
-      echo "add $d" >> "$DOMAINS_FILE"
+      queue_write "add $d"
       echo "Queued: add $d"
     done
     ;;
@@ -75,10 +82,9 @@ case "${1:-}" in
   --delete|-d)
     shift
     [[ $# -eq 0 ]] && { echo "Error: --delete requires at least one domain" >&2; exit 1; }
-    init_file
     for arg in "$@"; do
       d="$(normalize "$arg")"
-      echo "delete $d" >> "$DOMAINS_FILE"
+      queue_write "delete $d"
       echo "Queued: delete $d"
     done
     ;;
@@ -88,18 +94,16 @@ case "${1:-}" in
     [[ $# -lt 2 ]] && { echo "Error: --route requires a domain and folder name" >&2; exit 1; }
     d="$(normalize "$1")"
     folder="$2"
-    init_file
-    echo "route $d $folder" >> "$DOMAINS_FILE"
+    queue_write "route $d $folder"
     echo "Queued: route $d -> $folder"
     ;;
 
   --unroute)
     shift
     [[ $# -eq 0 ]] && { echo "Error: --unroute requires at least one domain" >&2; exit 1; }
-    init_file
     for arg in "$@"; do
       d="$(normalize "$arg")"
-      echo "unroute $d" >> "$DOMAINS_FILE"
+      queue_write "unroute $d"
       echo "Queued: unroute $d"
     done
     ;;

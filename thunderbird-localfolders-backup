@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Historical snapshot backup of Thunderbird Local Folders using restic.
+set -euo pipefail
+
+pcloud_mount="/mnt/pcloud"
+pcloud_drive="${HOME}/pCloudDrive"
+backup_root_rel="Thunderbird Backup"
+default_repo_subdir="localfolders-restic"
+
+keep_daily=7
+keep_weekly=4
+keep_monthly=12
+
+dry_run=false
+subcmd="backup"
+repo_arg=""
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--repo PATH] [SUBCOMMAND]
+
+Subcommands (default: backup):
+  backup     Create a new restic snapshot of Local Folders
+  init       Initialize the restic repository
+  snapshots  List existing snapshots
+  prune      Apply retention policy and remove old data
+
+Options:
+  --repo PATH  Restic repository path (overrides RESTIC_REPOSITORY and pCloud default)
+  --dry-run    Show what would happen without writing
+  -h, --help   Show this help
+
+Retention policy: keep last ${keep_daily} daily, ${keep_weekly} weekly, ${keep_monthly} monthly snapshots.
+
+Default repository: pCloud/${backup_root_rel}/${default_repo_subdir}
+Password: RESTIC_PASSWORD or RESTIC_PASSWORD_FILE env vars; or place password in
+  pCloud/${backup_root_rel}/.restic-password (chmod 600).
+EOF
+}
+
+# Parse args
+i=0
+args=("$@")
+while (( i < ${#args[@]} )); do
+    case "${args[$i]}" in
+        --dry-run) dry_run=true ;;
+        --repo)
+            (( i++ )) || true
+            repo_arg="${args[$i]}"
+            ;;
+        --repo=*) repo_arg="${args[$i]#--repo=}" ;;
+        -h|--help) usage; exit 0 ;;
+        backup|init|snapshots|prune) subcmd="${args[$i]}" ;;
+        *)
+            echo "Error: Unknown option: ${args[$i]}" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    (( i++ )) || true
+done
+
+if ! command -v restic &>/dev/null; then
+    echo "Error: restic not found. Install it with: sudo apt install restic" >&2
+    echo "  or see https://restic.net" >&2
+    exit 1
+fi
+
+# Resolve pCloud location
+if [[ -d "${pcloud_mount}" ]]; then
+    backup_root="${pcloud_mount}/${backup_root_rel}"
+elif [[ -d "${pcloud_drive}" ]]; then
+    backup_root="${pcloud_drive}/${backup_root_rel}"
+else
+    backup_root=""
+fi
+
+# Set repository
+if [[ -n "${repo_arg}" ]]; then
+    export RESTIC_REPOSITORY="${repo_arg}"
+elif [[ -z "${RESTIC_REPOSITORY:-}" ]]; then
+    if [[ -z "${backup_root}" ]]; then
+        echo "Error: No pCloud mount found and RESTIC_REPOSITORY not set." >&2
+        exit 1
+    fi
+    export RESTIC_REPOSITORY="${backup_root}/${default_repo_subdir}"
+fi
+
+# Use default password file if no password is configured
+if [[ -z "${RESTIC_PASSWORD:-}" && -z "${RESTIC_PASSWORD_FILE:-}" && -n "${backup_root}" ]]; then
+    default_pw="${backup_root}/.restic-password"
+    if [[ -f "${default_pw}" ]]; then
+        export RESTIC_PASSWORD_FILE="${default_pw}"
+    fi
+fi
+
+echo "Repository: ${RESTIC_REPOSITORY}"
+
+# ── subcommands that don't need profile detection ────────────────────────────
+
+if [[ "${subcmd}" == "init" ]]; then
+    if "${dry_run}"; then
+        echo "(dry-run: would run: restic init)"
+    else
+        mkdir -p "${RESTIC_REPOSITORY}"
+        restic init
+        echo
+        echo "Repository initialized."
+        if [[ -n "${backup_root}" ]]; then
+            pw_hint="${backup_root}/.restic-password"
+            echo "Tip: Save your password to ${pw_hint} (chmod 600) for automatic use."
+        fi
+    fi
+    exit 0
+fi
+
+if [[ "${subcmd}" == "snapshots" ]]; then
+    restic snapshots --tag local-folders
+    exit 0
+fi
+
+if [[ "${subcmd}" == "prune" ]]; then
+    prune_args=(
+        forget --prune
+        --keep-daily "${keep_daily}"
+        --keep-weekly "${keep_weekly}"
+        --keep-monthly "${keep_monthly}"
+        --tag local-folders
+    )
+    "${dry_run}" && prune_args+=(--dry-run)
+    restic "${prune_args[@]}"
+    exit 0
+fi
+
+# ── backup subcommand: requires profile detection ────────────────────────────
+
+run_quick_check() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5s "$@" >/dev/null 2>&1
+    else
+        "$@" >/dev/null 2>&1
+    fi
+}
+
+if command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird; then
+    tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+elif command -v snap &>/dev/null && run_quick_check snap list thunderbird; then
+    tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
+elif command -v thunderbird &>/dev/null; then
+    tb_dir="${HOME}/.thunderbird"
+else
+    echo "Error: No Thunderbird installation found." >&2
+    exit 1
+fi
+
+profiles_ini="${tb_dir}/profiles.ini"
+if [[ ! -f "${profiles_ini}" ]]; then
+    echo "Error: ${profiles_ini} not found." >&2
+    exit 1
+fi
+
+select_install_default() {
+    local ini="$1"
+    local base_dir="$2"
+    local line section def locked resolved
+    declare -A seen_existing_locked=()
+    declare -A seen_existing=()
+    declare -A seen_any=()
+    local existing_locked_count=0 existing_count=0 any_count=0
+    local first_existing_locked="" first_existing="" first_any=""
+
+    while IFS='|' read -r section def locked; do
+        [[ -n "${def}" ]] || continue
+        if [[ "${def}" = /* ]]; then resolved="${def}"; else resolved="${base_dir}/${def}"; fi
+        if [[ -z "${seen_any[${def}]+x}" ]]; then
+            seen_any["${def}"]=1; ((any_count++)) || true
+            [[ -z "${first_any}" ]] && first_any="${def}"
+        fi
+        if [[ -d "${resolved}" ]]; then
+            if [[ -z "${seen_existing[${def}]+x}" ]]; then
+                seen_existing["${def}"]=1; ((existing_count++)) || true
+                [[ -z "${first_existing}" ]] && first_existing="${def}"
+            fi
+            if [[ "${locked}" == "1" && -z "${seen_existing_locked[${def}]+x}" ]]; then
+                seen_existing_locked["${def}"]=1; ((existing_locked_count++)) || true
+                [[ -z "${first_existing_locked}" ]] && first_existing_locked="${def}"
+            fi
+        fi
+    done < <(awk -F= '
+        /^\[Install[^]]*\]/ {
+            if (in_install && def != "") print section "|" def "|" locked
+            in_install=1; section=$0
+            gsub(/^\[/, "", section); gsub(/\]$/, "", section)
+            def=""; locked="0"; next
+        }
+        /^\[/ {
+            if (in_install && def != "") print section "|" def "|" locked
+            in_install=0; next
+        }
+        in_install && /^Default=/ { def=$2 }
+        in_install && /^Locked=1$/ { locked="1" }
+        END { if (in_install && def != "") print section "|" def "|" locked }
+    ' "${ini}")
+
+    if (( existing_locked_count == 1 )); then echo "${first_existing_locked}"
+    elif (( existing_count == 1 ));        then echo "${first_existing}"
+    elif (( any_count == 1 ));             then echo "${first_any}"
+    fi
+}
+
+active_profile=$(select_install_default "${profiles_ini}" "${tb_dir}")
+
+if [[ -n "${active_profile}" ]]; then
+    if [[ "${active_profile}" = /* ]]; then
+        profile_path="${active_profile}"
+    else
+        profile_path="${tb_dir}/${active_profile}"
+    fi
+else
+    profile_info=$(awk -F= '
+        /^\[Profile/ {
+            if (in_profile && is_default && path != "") {print path "|" rel; exit}
+            in_profile=1; is_default=0; path=""; rel=""
+        }
+        /^\[/ && $0 !~ /^\[Profile/ {in_profile=0}
+        in_profile && /^Default=1/ {is_default=1}
+        in_profile && /^Path=/ {path=$2}
+        in_profile && /^IsRelative=/ {rel=$2}
+        END { if (is_default && path != "") {print path "|" rel} }
+    ' "${profiles_ini}")
+    profile_rel="${profile_info##*|}"
+    profile_path_raw="${profile_info%%|*}"
+    if [[ -z "${profile_path_raw}" ]]; then
+        echo "Error: Could not determine active Thunderbird profile." >&2
+        exit 1
+    fi
+    if [[ "${profile_rel}" = "1" ]]; then
+        profile_path="${tb_dir}/${profile_path_raw}"
+    else
+        profile_path="${profile_path_raw}"
+    fi
+fi
+
+local_folders="${profile_path}/Mail/Local Folders"
+if [[ ! -d "${local_folders}" ]]; then
+    echo "Error: Local Folders directory not found: ${local_folders}" >&2
+    exit 1
+fi
+
+echo "Local Folders: ${local_folders}"
+echo
+
+backup_args=(
+    backup
+    --tag thunderbird
+    --tag local-folders
+    --host "$(hostname -s)"
+    "${local_folders}"
+)
+"${dry_run}" && backup_args+=(--dry-run)
+
+restic "${backup_args[@]}"

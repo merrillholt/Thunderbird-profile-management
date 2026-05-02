@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Message-level mbox merge for Thunderbird local folders.
+
+Saves messages unique to the destination (not in backup) before a restore
+overwrites the profile, then re-merges them afterwards so no accumulated
+messages are lost.
+
+Usage:
+  thunderbird-mbox-merge snapshot <src_local_dir> <dest_local_dir> <work_dir>
+      Collect messages in dest not present in src; write to work_dir.
+
+  thunderbird-mbox-merge merge <dest_local_dir> <work_dir>
+      Append saved messages into the restored dest mboxes.
+      Removes .msf index files for modified folders so Thunderbird
+      rebuilds them on next open.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import mailbox
+import sys
+from pathlib import Path
+
+
+def message_key(msg) -> str:
+    mid = msg.get("Message-ID", "").strip()
+    if mid:
+        return mid
+    return "sha256:" + hashlib.sha256(msg.as_bytes()).hexdigest()
+
+
+def mbox_files(directory: Path) -> list[Path]:
+    """Return regular mbox files in a Local Folders directory (no .msf, no dirs)."""
+    if not directory.is_dir():
+        return []
+    return sorted(p for p in directory.iterdir()
+                  if p.is_file() and p.suffix != ".msf")
+
+
+def read_keys(path: Path) -> set[str]:
+    keys: set[str] = set()
+    try:
+        mb = mailbox.mbox(str(path), create=False)
+        for msg in mb:
+            keys.add(message_key(msg))
+        mb.close()
+    except Exception as e:
+        print(f"  Warning: could not read {path.name}: {e}", file=sys.stderr)
+    return keys
+
+
+def cmd_snapshot(src_dir: Path, dest_dir: Path, work_dir: Path) -> int:
+    """Save dest messages not present in src to work_dir."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    total = 0
+    folders = 0
+    for dest_mbox in mbox_files(dest_dir):
+        src_mbox = src_dir / dest_mbox.name
+        src_keys = read_keys(src_mbox) if src_mbox.exists() else set()
+        unique: list[mailbox.mboxMessage] = []
+        try:
+            mb = mailbox.mbox(str(dest_mbox), create=False)
+            for msg in mb:
+                if message_key(msg) not in src_keys:
+                    unique.append(msg)
+            mb.close()
+        except Exception as e:
+            print(f"  Warning: could not read {dest_mbox.name}: {e}", file=sys.stderr)
+            continue
+        if unique:
+            out = mailbox.mbox(str(work_dir / dest_mbox.name), create=True)
+            for msg in unique:
+                out.add(msg)
+            out.flush()
+            out.close()
+            total += len(unique)
+            folders += 1
+            print(f"  {dest_mbox.name}: {len(unique)} message(s) to preserve")
+    if total:
+        print(f"  Total: {total} message(s) across {folders} folder(s)")
+    else:
+        print("  (nothing to preserve)")
+    return 0
+
+
+def cmd_merge(dest_dir: Path, work_dir: Path) -> int:
+    """Append saved messages into the restored dest mboxes."""
+    saved = mbox_files(work_dir)
+    if not saved:
+        print("  (no messages to merge)")
+        return 0
+    total = 0
+    for saved_mbox in saved:
+        dest_mbox = dest_dir / saved_mbox.name
+        existing = read_keys(dest_mbox) if dest_mbox.exists() else set()
+        to_add: list[mailbox.mboxMessage] = []
+        try:
+            mb = mailbox.mbox(str(saved_mbox), create=False)
+            for msg in mb:
+                if message_key(msg) not in existing:
+                    to_add.append(msg)
+            mb.close()
+        except Exception as e:
+            print(f"  Warning: could not read saved {saved_mbox.name}: {e}", file=sys.stderr)
+            continue
+        if not to_add:
+            continue
+        try:
+            dst = mailbox.mbox(str(dest_mbox), create=True)
+            for msg in to_add:
+                dst.add(msg)
+            dst.flush()
+            dst.close()
+        except Exception as e:
+            print(f"  Warning: could not write {dest_mbox.name}: {e}", file=sys.stderr)
+            continue
+        msf = dest_mbox.with_suffix(".msf")
+        if msf.exists():
+            msf.unlink()
+        total += len(to_add)
+        print(f"  {dest_mbox.name}: merged {len(to_add)} message(s)")
+    if total:
+        print(f"  Total merged: {total} message(s)")
+    else:
+        print("  (nothing new to merge)")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if len(args) == 4 and args[0] == "snapshot":
+        return cmd_snapshot(Path(args[1]), Path(args[2]), Path(args[3]))
+    if len(args) == 3 and args[0] == "merge":
+        return cmd_merge(Path(args[1]), Path(args[2]))
+    print(__doc__.strip(), file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+MERGE_HELPER="${SCRIPT_DIR}/thunderbird-mbox-merge"
+
 log_file="${HOME}/thunderbird-restore.log"
 dry_run=false
 self_test=false
 self_test_root=""
+no_merge=false
+merge_work_dir=""
+merge_status="Skipped"
+
+trap '[[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"' EXIT
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run] [--self-test]
+Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test]
 
 Options:
   --dry-run    Show what would be restored without making changes
+  --no-merge   Replace local folders entirely (skip message-level merge)
   --self-test  Run a safe self-test using temporary data
   -h, --help   Show this help
 EOF
@@ -20,6 +29,7 @@ EOF
 for arg in "$@"; do
     case "${arg}" in
         --dry-run) dry_run=true ;;
+        --no-merge) no_merge=true ;;
         --self-test) self_test=true ;;
         -h|--help) usage; exit 0 ;;
         *)
@@ -38,7 +48,7 @@ setup_self_test() {
     local root
     self_test_root=$(mktemp -d)
     root="${self_test_root}"
-    trap 'rm -rf "${self_test_root}"' EXIT
+    trap 'rm -rf "${self_test_root}"; [[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"' EXIT
     tb_type="SelfTest"
     tb_version="self-test"
     tb_dir="${root}/tb"
@@ -274,7 +284,9 @@ fi
 dest="${profile_path}/"
 
 check_thunderbird_running() {
-    pgrep -x thunderbird &>/dev/null || { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
+    pgrep -x thunderbird &>/dev/null || \
+    pgrep -x thunderbird-bin &>/dev/null || \
+    { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
 }
 
 reset_profile_runtime_state() {
@@ -391,6 +403,22 @@ if [[ "${resolved_dest}" != "${resolved_tb_dir}"/* ]]; then
     exit 1
 fi
 
+# ── Local folder merge: snapshot pre-restore messages ─────────────────────
+if ! "${no_merge}" && ! "${dry_run}" && ! "${self_test}"; then
+    src_local="${src%/}/Mail/Local Folders"
+    dest_local="${dest%/}/Mail/Local Folders"
+    if [[ -d "${dest_local}" ]] && [[ -f "${MERGE_HELPER}" ]]; then
+        merge_work_dir=$(mktemp -d)
+        echo "Preserving local folder messages not in backup..."
+        python3 "${MERGE_HELPER}" snapshot "${src_local}" "${dest_local}" "${merge_work_dir}" || true
+        echo
+    else
+        merge_status="Nothing to preserve (no local folders)"
+    fi
+elif "${no_merge}"; then
+    merge_status="Skipped (--no-merge)"
+fi
+
 echo
 start_time=$(date +%s)
 tmp_dry_dest=""
@@ -406,6 +434,21 @@ if "${dry_run}"; then
     rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${rsync_dest}")
 else
     rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
+
+    # ── Local folder merge: re-add preserved messages ─────────────────────
+    if [[ -n "${merge_work_dir}" ]]; then
+        dest_local="${dest%/}/Mail/Local Folders"
+        echo "Merging preserved messages..."
+        if python3 "${MERGE_HELPER}" merge "${dest_local}" "${merge_work_dir}"; then
+            merge_status="Complete"
+        else
+            merge_status="Failed (see output above)"
+        fi
+        rm -rf "${merge_work_dir}"
+        merge_work_dir=""
+        echo
+    fi
+
     reset_profile_runtime_state "${dest%/}"
 fi
 [[ -n "${tmp_dry_dest}" ]] && rm -rf "${tmp_dry_dest}"
@@ -522,12 +565,15 @@ if ! "${dry_run}" && ! "${self_test}"; then
     post_restore_notes=$(cat <<'NOTES'
 
   Next steps:
-  1. Start Thunderbird and verify all accounts connect.
-  2. Re-enter account passwords if prompted (system keyring is not
+  1. Run: tbblock-rebuild
+     (applies pending filter changes and sets review/no-review role
+     for this machine based on ~/.config/tbblock/no-review)
+  2. Start Thunderbird and verify all accounts connect.
+  3. Re-enter account passwords if prompted (system keyring is not
      included in the profile backup).
-  3. If Thunderbird is Flatpak, verify sandbox permissions:
+  4. If Thunderbird is Flatpak, verify sandbox permissions:
        flatpak override --user --show org.mozilla.Thunderbird
-  4. If native messaging hosts were not restored (e.g. first install),
+  5. If native messaging hosts were not restored (e.g. first install),
      run: install-native-host
 NOTES
 )
@@ -550,6 +596,7 @@ report=$(cat <<EOF
   Total files:        ${file_count}
   Restored size:      ${restored_size}
   Profile size:       ${profile_size}
+  Local folder merge: ${merge_status}
   MIME defaults:      ${mime_status}
   Flatpak sandbox:    ${flatpak_status}
   Native msg hosts:   ${nm_host_status}

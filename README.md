@@ -11,6 +11,8 @@ System, Flatpak, and Snap installations.
 - `thunderbird-restore`: Restore profile contents from a backup. On a new
   Kubuntu system, install Thunderbird first, launch it once to create a target
   profile, then run this script.
+- `thunderbird-localfolders-backup`: Historical snapshot backup of Local Folders
+  using restic. Scheduled automatically by `install` via systemd timers.
 - `tbq-filter-audit`: Read-only filter-rule simulator for messages in a
   Thunderbird mbox folder. It can explain which rule would catch messages in
   folders such as `Local Folders/Review`.
@@ -30,7 +32,72 @@ System, Flatpak, and Snap installations.
 ./tbq-filter-audit --account bluerug --search affirm --show-notes
 ./tbq-filter-audit --account bluerug --search paypal --why
 ./tbq-filter-audit --preserve-tags --limit 10
+./thunderbird-localfolders-backup init
+./thunderbird-localfolders-backup
+./thunderbird-localfolders-backup snapshots
+./thunderbird-localfolders-backup prune
 ```
+
+## Local Folders historical backup (restic)
+
+`thunderbird-localfolders-backup` keeps dated snapshots of `Mail/Local Folders`
+so you can recover individual messages deleted weeks ago, even after a
+`thunderbird-backup`/restore cycle has overwritten the mirror.
+
+**First-time setup (once, on one machine):**
+
+```bash
+# Generate a password and store it (pCloud syncs it to all machines)
+openssl rand -base64 32 > ~/pcloud/"Thunderbird Backup"/.restic-password
+chmod 600 ~/pcloud/"Thunderbird Backup"/.restic-password
+
+# Initialize the shared repository on pCloud
+thunderbird-localfolders-backup init
+```
+
+**On every machine** — run `install` to create `~/bin` symlinks and enable the
+systemd timers (daily backup at 9am, monthly prune on the 1st). If the machine
+is asleep at the scheduled time the job runs automatically on next wake.
+
+```bash
+./install
+```
+
+Check timer status and logs:
+
+```bash
+systemctl --user list-timers tb-localfolders-backup.timer tb-localfolders-prune.timer
+journalctl --user -u tb-localfolders-backup
+```
+
+**Restore a specific file from a snapshot:**
+
+```bash
+restic -r ~/pcloud/"Thunderbird Backup"/localfolders-restic snapshots
+restic -r ~/pcloud/"Thunderbird Backup"/localfolders-restic restore <snapshot-id> \
+  --include "Inbox" --target /tmp/tb-restore
+```
+
+## Multi-system setup (review vs non-review)
+
+One machine is the designated review system; others should have the catch-all
+quarantine filter disabled so they do not steal incoming mail before the review
+system processes it.
+
+On each **non-review** machine, create the marker file once:
+
+```bash
+mkdir -p ~/.config/tbblock && touch ~/.config/tbblock/no-review
+```
+
+After that, running `tbblock-rebuild` on that machine automatically disables the
+catch-all in the filter files. After restoring a backup from the review system
+onto a non-review machine, just run `tbblock-rebuild` (with Thunderbird closed)
+and the catch-all will be disabled again automatically.
+
+`tbblock-rebuild --list` shows the current role and catch-all state for all
+accounts. `tbblock-rebuild --no-review` forces non-review behaviour for a single
+run without creating the marker file.
 
 ## Notes
 - The audit script is verbose by design and reports sizes, mtimes, and validation checks.

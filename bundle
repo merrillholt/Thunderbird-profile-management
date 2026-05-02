@@ -1,1 +1,5 @@
-cd ~/thunderbird-review-actions && zip -j thunderbird-review-actions.xpi manifest.json background.js popup.html popup.js
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+cd "${SCRIPT_DIR}/thunderbird-review-actions"
+zip -j thunderbird-review-actions.xpi manifest.json background.js popup.html popup.js

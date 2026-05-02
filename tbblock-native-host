@@ -10,12 +10,14 @@ little-endian uint32 length prefix followed by UTF-8 JSON.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import struct
 import sys
 from pathlib import Path
 
 DOMAINS_FILE = Path(__file__).resolve().parent / "blocked_domains.txt"
+_LOCK_FILE = DOMAINS_FILE.parent / (DOMAINS_FILE.name + ".lock")
 
 
 def read_message() -> dict | None:
@@ -40,12 +42,16 @@ def normalize(d: str) -> str:
     return "@" + d.strip().lstrip("@").lower()
 
 
-def init_file() -> None:
-    if not DOMAINS_FILE.exists():
-        DOMAINS_FILE.write_text(
-            "# Pending domain block changes. Managed by tbblock.\n"
-            "# Run tbblock-rebuild to apply. File is cleared after apply.\n"
-        )
+def append_to_queue(line: str) -> None:
+    with _LOCK_FILE.open("w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        if not DOMAINS_FILE.exists():
+            DOMAINS_FILE.write_text(
+                "# Pending domain block changes. Managed by tbblock.\n"
+                "# Run tbblock-rebuild to apply. File is cleared after apply.\n"
+            )
+        with DOMAINS_FILE.open("a") as f:
+            f.write(line + "\n")
 
 
 def handle(msg: dict) -> dict:
@@ -56,9 +62,7 @@ def handle(msg: dict) -> dict:
         if not raw:
             return {"ok": False, "error": "missing domain"}
         domain = normalize(raw)
-        init_file()
-        with DOMAINS_FILE.open("a") as f:
-            f.write(f"add {domain}\n")
+        append_to_queue(f"add {domain}")
         return {"ok": True, "message": f"Queued: add {domain}"}
 
     if msg_type == "tbblock-delete":
@@ -66,9 +70,7 @@ def handle(msg: dict) -> dict:
         if not raw:
             return {"ok": False, "error": "missing domain"}
         domain = normalize(raw)
-        init_file()
-        with DOMAINS_FILE.open("a") as f:
-            f.write(f"delete {domain}\n")
+        append_to_queue(f"delete {domain}")
         return {"ok": True, "message": f"Queued: delete {domain}"}
 
     if msg_type == "tbblock-route":
@@ -79,9 +81,7 @@ def handle(msg: dict) -> dict:
         if not folder:
             return {"ok": False, "error": "missing folder"}
         domain = normalize(raw)
-        init_file()
-        with DOMAINS_FILE.open("a") as f:
-            f.write(f"route {domain} {folder}\n")
+        append_to_queue(f"route {domain} {folder}")
         return {"ok": True, "message": f"Queued: route {domain} -> {folder}"}
 
     if msg_type == "tbblock-unroute":
@@ -89,9 +89,7 @@ def handle(msg: dict) -> dict:
         if not raw:
             return {"ok": False, "error": "missing domain"}
         domain = normalize(raw)
-        init_file()
-        with DOMAINS_FILE.open("a") as f:
-            f.write(f"unroute {domain}\n")
+        append_to_queue(f"unroute {domain}")
         return {"ok": True, "message": f"Queued: unroute {domain}"}
 
     if msg_type == "tbblock-list":

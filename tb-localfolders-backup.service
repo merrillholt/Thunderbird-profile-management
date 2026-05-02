@@ -1,0 +1,6 @@
+[Unit]
+Description=Thunderbird Local Folders restic backup
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/thunderbird-localfolders-backup

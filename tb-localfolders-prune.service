@@ -1,0 +1,6 @@
+[Unit]
+Description=Thunderbird Local Folders restic prune
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/thunderbird-localfolders-backup prune

@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# Create (or remove) ~/bin symlinks and systemd user timers for thunderbird-tools.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+BIN_DIR="${HOME}/bin"
+SYSTEMD_DIR="${HOME}/.config/systemd/user"
+
+# User-facing scripts to expose in ~/bin.
+# Helpers invoked internally (tbblock-native-host, thunderbird-mbox-merge)
+# are omitted — they are called by full path via SCRIPT_DIR at runtime.
+SCRIPTS=(
+    tbblock
+    tbblock-rebuild
+    tbq-filter-audit
+    thunderbird-audit
+    thunderbird-backup
+    thunderbird-restore
+    thunderbird-localfolders-backup
+    thunderbird-dedup-local
+    install-native-host
+    bundle
+)
+
+# Systemd user units to install into ~/.config/systemd/user/.
+UNITS=(
+    tb-localfolders-backup.service
+    tb-localfolders-backup.timer
+    tb-localfolders-prune.service
+    tb-localfolders-prune.timer
+)
+
+# Timers to enable/disable (units without a corresponding .timer need not be listed).
+TIMERS=(
+    tb-localfolders-backup.timer
+    tb-localfolders-prune.timer
+)
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--uninstall]
+
+Create (or remove) symlinks in ${BIN_DIR} and systemd user timer units
+pointing to: ${SCRIPT_DIR}
+
+Options:
+  --dry-run    Show what would be done without making changes
+  --uninstall  Remove symlinks and disable timers instead of installing
+  -h, --help   Show this help
+EOF
+}
+
+dry_run=false
+uninstall=false
+
+for arg in "$@"; do
+    case "${arg}" in
+        --dry-run)   dry_run=true ;;
+        --uninstall) uninstall=true ;;
+        -h|--help)   usage; exit 0 ;;
+        *)
+            echo "Error: Unknown option: ${arg}" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Verify the source directory is accessible (pCloud mount may not be up).
+if [[ ! -d "${SCRIPT_DIR}" ]]; then
+    echo "Error: source directory not found: ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+
+# Ensure ~/bin exists.
+if [[ ! -d "${BIN_DIR}" ]]; then
+    if "${dry_run}"; then
+        echo "Would create: ${BIN_DIR}"
+    else
+        mkdir -p "${BIN_DIR}"
+        echo "Created: ${BIN_DIR}"
+    fi
+fi
+
+created=0
+updated=0
+skipped=0
+removed=0
+errors=0
+
+for script in "${SCRIPTS[@]}"; do
+    src="${SCRIPT_DIR}/${script}"
+    dst="${BIN_DIR}/${script}"
+
+    if [[ ! -f "${src}" ]]; then
+        echo "Warning: not found in source, skipping: ${src}" >&2
+        (( errors++ )) || true
+        continue
+    fi
+
+    if "${uninstall}"; then
+        if [[ -L "${dst}" ]]; then
+            if "${dry_run}"; then
+                echo "Would remove symlink: ${dst}"
+            else
+                rm "${dst}"
+                echo "Removed: ${dst}"
+            fi
+            (( removed++ )) || true
+        elif [[ -e "${dst}" ]]; then
+            echo "Warning: ${dst} is not a symlink — skipping" >&2
+            (( errors++ )) || true
+        else
+            echo "Already absent: ${dst}"
+            (( skipped++ )) || true
+        fi
+        continue
+    fi
+
+    # Ensure source is executable.
+    if [[ ! -x "${src}" ]]; then
+        if "${dry_run}"; then
+            echo "Would chmod +x: ${src}"
+        else
+            chmod +x "${src}"
+        fi
+    fi
+
+    if [[ -L "${dst}" ]]; then
+        current="$(readlink "${dst}")"
+        if [[ "${current}" == "${src}" ]]; then
+            echo "Up to date:  ${dst}"
+            (( skipped++ )) || true
+        else
+            if "${dry_run}"; then
+                echo "Would update: ${dst}"
+                echo "             was -> ${current}"
+                echo "          new -> ${src}"
+            else
+                ln -sf "${src}" "${dst}"
+                echo "Updated:     ${dst}"
+                echo "             was -> ${current}"
+                echo "          new -> ${src}"
+            fi
+            (( updated++ )) || true
+        fi
+    elif [[ -e "${dst}" ]]; then
+        echo "Warning: ${dst} exists and is not a symlink — skipping" >&2
+        (( errors++ )) || true
+    else
+        if "${dry_run}"; then
+            echo "Would create: ${dst} -> ${src}"
+        else
+            ln -s "${src}" "${dst}"
+            echo "Created:     ${dst}"
+            echo "          -> ${src}"
+        fi
+        (( created++ )) || true
+    fi
+done
+
+echo
+if "${uninstall}"; then
+    echo "Scripts — Removed: ${removed}, already absent: ${skipped}, errors: ${errors}"
+else
+    echo "Scripts — Created: ${created}, updated: ${updated}, up to date: ${skipped}, errors: ${errors}"
+fi
+
+# ── systemd user units ────────────────────────────────────────────────────────
+
+if ! command -v systemctl &>/dev/null; then
+    echo "Note: systemctl not found — skipping unit installation."
+    exit 0
+fi
+
+echo
+
+ucreated=0
+uupdated=0
+uskipped=0
+uremoved=0
+
+# Ensure systemd user dir exists.
+if [[ ! -d "${SYSTEMD_DIR}" ]]; then
+    if "${dry_run}"; then
+        echo "Would create: ${SYSTEMD_DIR}"
+    else
+        mkdir -p "${SYSTEMD_DIR}"
+        echo "Created: ${SYSTEMD_DIR}"
+    fi
+fi
+
+for unit in "${UNITS[@]}"; do
+    src="${SCRIPT_DIR}/${unit}"
+    dst="${SYSTEMD_DIR}/${unit}"
+
+    if [[ ! -f "${src}" ]]; then
+        echo "Warning: not found in source, skipping: ${src}" >&2
+        (( errors++ )) || true
+        continue
+    fi
+
+    if "${uninstall}"; then
+        if [[ -L "${dst}" ]]; then
+            if "${dry_run}"; then
+                echo "Would remove symlink: ${dst}"
+            else
+                rm "${dst}"
+                echo "Removed: ${dst}"
+            fi
+            (( uremoved++ )) || true
+        elif [[ -e "${dst}" ]]; then
+            echo "Warning: ${dst} is not a symlink — skipping" >&2
+            (( errors++ )) || true
+        else
+            echo "Already absent: ${dst}"
+            (( uskipped++ )) || true
+        fi
+        continue
+    fi
+
+    if [[ -L "${dst}" ]]; then
+        current="$(readlink "${dst}")"
+        if [[ "${current}" == "${src}" ]]; then
+            echo "Up to date:  ${dst}"
+            (( uskipped++ )) || true
+        else
+            if "${dry_run}"; then
+                echo "Would update: ${dst}"
+                echo "             was -> ${current}"
+                echo "          new -> ${src}"
+            else
+                ln -sf "${src}" "${dst}"
+                echo "Updated:     ${dst}"
+            fi
+            (( uupdated++ )) || true
+        fi
+    elif [[ -e "${dst}" ]]; then
+        echo "Warning: ${dst} exists and is not a symlink — skipping" >&2
+        (( errors++ )) || true
+    else
+        if "${dry_run}"; then
+            echo "Would create: ${dst} -> ${src}"
+        else
+            ln -s "${src}" "${dst}"
+            echo "Created:     ${dst}"
+        fi
+        (( ucreated++ )) || true
+    fi
+done
+
+# Reload and enable/disable timers.
+if "${dry_run}"; then
+    if "${uninstall}"; then
+        echo "Would run: systemctl --user disable --now ${TIMERS[*]}"
+    else
+        echo "Would run: systemctl --user daemon-reload"
+        echo "Would run: systemctl --user enable --now ${TIMERS[*]}"
+    fi
+else
+    systemctl --user daemon-reload
+    if "${uninstall}"; then
+        systemctl --user disable --now "${TIMERS[@]}" 2>/dev/null || true
+        echo "Timers disabled."
+    else
+        systemctl --user enable --now "${TIMERS[@]}"
+        echo "Timers enabled."
+    fi
+fi
+
+echo
+if "${uninstall}"; then
+    echo "Units  — Removed: ${uremoved}, already absent: ${uskipped}, errors: ${errors}"
+else
+    echo "Units  — Created: ${ucreated}, updated: ${uupdated}, up to date: ${uskipped}, errors: ${errors}"
+fi

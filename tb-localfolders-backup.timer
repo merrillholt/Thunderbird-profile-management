@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Thunderbird Local Folders backup
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

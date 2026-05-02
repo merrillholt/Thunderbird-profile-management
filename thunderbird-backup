@@ -267,7 +267,9 @@ echo "Backing up from ${src} to ${dest}"
 echo
 
 check_thunderbird_running() {
-    pgrep -x thunderbird &>/dev/null || { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
+    pgrep -x thunderbird &>/dev/null || \
+    pgrep -x thunderbird-bin &>/dev/null || \
+    { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
 }
 
 if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then

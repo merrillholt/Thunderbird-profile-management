@@ -8,6 +8,7 @@
 
 # Transient queue state — created and cleared by tbblock/tbblock-rebuild
 blocked_domains.txt
+blocked_domains.txt.lock
 
 # Python
 __pycache__/
