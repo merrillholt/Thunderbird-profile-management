@@ -24,6 +24,15 @@ async function getCurrentMessage() {
   return message;
 }
 
+async function getCurrentContext() {
+  const tab = await getCurrentTab();
+  const message = await messenger.messageDisplay.getDisplayedMessage(tab.id);
+  if (!message) {
+    throw new Error("No displayed message found.");
+  }
+  return { tab, message };
+}
+
 function extractEmailAddress(author) {
   if (!author) {
     throw new Error("Message does not have an author field.");
@@ -147,33 +156,74 @@ async function findInboxCopies(headerMessageId, excludeId) {
   return matches;
 }
 
+async function getReviewMessagesForAdvance(tab, reviewFolder) {
+  try {
+    await messenger.mailTabs.get(tab.id);
+    const selectedFolders = await messenger.mailTabs.getSelectedFolders(tab.id);
+    if (selectedFolders.some(f => f.id === reviewFolder.id)) {
+      const listed = await messenger.mailTabs.getListedMessages(tab.id);
+      return { messages: listed.messages || [], mailTabId: tab.id };
+    }
+  } catch (e) {
+    // The action may be running from a standalone message tab/window instead
+    // of the 3-pane mail tab. Fall through to a folder query.
+  }
+
+  const [mailTab] = await messenger.mailTabs.query({ active: true, currentWindow: true });
+  if (mailTab) {
+    try {
+      const selectedFolders = await messenger.mailTabs.getSelectedFolders(mailTab.id);
+      if (selectedFolders.some(f => f.id === reviewFolder.id)) {
+        const listed = await messenger.mailTabs.getListedMessages(mailTab.id);
+        return { messages: listed.messages || [], mailTabId: mailTab.id };
+      }
+    } catch (e) {
+      // Try other mail tabs before falling through to an unordered folder query.
+    }
+  }
+
+  for (const candidate of await messenger.mailTabs.query({})) {
+    try {
+      const selectedFolders = await messenger.mailTabs.getSelectedFolders(candidate.id);
+      if (selectedFolders.some(f => f.id === reviewFolder.id)) {
+        const listed = await messenger.mailTabs.getListedMessages(candidate.id);
+        return { messages: listed.messages || [], mailTabId: candidate.id };
+      }
+    } catch (e) {
+      // Ignore tabs that cannot provide a Review folder listing.
+    }
+  }
+
+  const results = await messenger.messages.query({ folderId: reviewFolder.id });
+  return { messages: results.messages || [], mailTabId: mailTab?.id || null };
+}
+
 // Permanently delete a message from the Review folder and advance the mail
 // tab selection to the next (or previous) sibling in that folder.
-async function deleteAndAdvance(messageId, reviewFolder) {
-  const results = await messenger.messages.query({ folderId: reviewFolder.id });
-  const messages = results.messages || [];
+async function deleteAndAdvance(messageId, reviewFolder, sourceTab) {
+  const { messages, mailTabId } = await getReviewMessagesForAdvance(sourceTab, reviewFolder);
   const idx = messages.findIndex(m => m.id === messageId);
   const next = idx !== -1 ? (messages[idx + 1] || messages[idx - 1] || null) : null;
 
   await messenger.messages.delete([messageId], true);
 
-  if (next) {
-    const [mailTab] = await messenger.mailTabs.query({ currentWindow: true });
-    if (mailTab) {
-      await messenger.mailTabs.setSelectedMessages(mailTab.id, [next.id]);
-    }
+  if (next && mailTabId) {
+    await messenger.mailTabs.setSelectedMessages(mailTabId, [next.id]);
   }
+
+  return { advanced: !!(next && mailTabId) };
 }
 
 async function approveSender() {
-  const message = await getCurrentMessage();
+  const { tab, message } = await getCurrentContext();
   const email = extractEmailAddress(message.author);
   const reviewFolder = await getReviewFolderFor(message.id, message.headerMessageId);
 
   const whitelistResult = await ensureWhitelisted(email, message.author);
 
+  let advanceResult = null;
   if (reviewFolder) {
-    await deleteAndAdvance(message.id, reviewFolder);
+    advanceResult = await deleteAndAdvance(message.id, reviewFolder, tab);
   }
 
   return {
@@ -181,12 +231,13 @@ async function approveSender() {
     action: "approve-sender",
     email,
     created: whitelistResult.created,
-    inReview: !!reviewFolder
+    inReview: !!reviewFolder,
+    advanced: !!advanceResult?.advanced
   };
 }
 
 async function markTrash() {
-  const message = await getCurrentMessage();
+  const { tab, message } = await getCurrentContext();
   const reviewFolder = await getReviewFolderFor(message.id, message.headerMessageId);
 
   let senderAdded = null;
@@ -205,13 +256,14 @@ async function markTrash() {
         tagged++;
       }
     }
-    await deleteAndAdvance(message.id, reviewFolder);
+    const advanceResult = await deleteAndAdvance(message.id, reviewFolder, tab);
     return {
       ok: true,
       action: "mark-trash",
       inReview: true,
       tagged,
-      senderAdded
+      senderAdded,
+      advanced: advanceResult.advanced
     };
   }
 
@@ -233,7 +285,14 @@ async function getLocalFolders() {
   const skip = new Set(["trash", "junk", "drafts", "sent", "outbox", "templates"]);
   return folders
     .filter(f => !skip.has(f.type || ""))
-    .map(f => ({ name: f.name, path: f.path }));
+    .map(f => {
+      const path = f.path || f.name;
+      return {
+        name: f.name,
+        path,
+        label: path === f.name ? f.name : `${path} (${f.name})`
+      };
+    });
 }
 
 async function queueDomainBlock(domain) {
@@ -252,7 +311,7 @@ async function queueDomainBlock(domain) {
 }
 
 async function markTrashDomain() {
-  const message = await getCurrentMessage();
+  const { tab, message } = await getCurrentContext();
   const email = extractEmailAddress(message.author);
   const domain = "@" + email.split("@")[1];
   const reviewFolder = await getReviewFolderFor(message.id, message.headerMessageId);
@@ -274,7 +333,7 @@ async function markTrashDomain() {
         tagged++;
       }
     }
-    await deleteAndAdvance(message.id, reviewFolder);
+    const advanceResult = await deleteAndAdvance(message.id, reviewFolder, tab);
     return {
       ok: true,
       action: "mark-trash-domain",
@@ -282,6 +341,7 @@ async function markTrashDomain() {
       inReview: true,
       tagged,
       senderAdded,
+      advanced: advanceResult.advanced,
       ...queueResult
     };
   }
@@ -324,7 +384,7 @@ async function routeDomain(folderName) {
 }
 
 async function markJunk() {
-  const message = await getCurrentMessage();
+  const { tab, message } = await getCurrentContext();
   const reviewFolder = await getReviewFolderFor(message.id, message.headerMessageId);
 
   if (reviewFolder) {
@@ -335,12 +395,13 @@ async function markJunk() {
       await messenger.messages.delete([other.id], true);
       marked++;
     }
-    await deleteAndAdvance(message.id, reviewFolder);
+    const advanceResult = await deleteAndAdvance(message.id, reviewFolder, tab);
     return {
       ok: true,
       action: "mark-junk",
       inReview: true,
-      marked
+      marked,
+      advanced: advanceResult.advanced
     };
   }
 

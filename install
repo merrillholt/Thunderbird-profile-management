@@ -19,6 +19,7 @@ SCRIPTS=(
     thunderbird-localfolders-backup
     thunderbird-dedup-local
     install-native-host
+    install-review-actions
     bundle
 )
 

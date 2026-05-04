@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Permanently install or uninstall the review actions XPI for Flatpak Thunderbird.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+XPI="${SCRIPT_DIR}/thunderbird-review-actions/thunderbird-review-actions.xpi"
+EXTENSION_ID="thunderbird-review-actions@merrill.local"
+FLATPAK_TB_DIR="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+
+dry_run=false
+uninstall=false
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--uninstall]
+
+Permanently sideload Thunderbird Review Actions into the active Flatpak
+Thunderbird profile. Thunderbird must be closed before installing.
+
+Options:
+  --dry-run    Show what would be done without changing files
+  --uninstall  Remove the sideloaded extension from the active profile
+  -h, --help   Show this help
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=true ;;
+    --uninstall) uninstall=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+run() {
+  if "${dry_run}"; then
+    printf 'Would run:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+run_quick_check() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5s "$@" >/dev/null 2>&1
+  else
+    "$@" >/dev/null 2>&1
+  fi
+}
+
+if ! command -v flatpak >/dev/null 2>&1 || ! run_quick_check flatpak info org.mozilla.Thunderbird; then
+  echo "Error: Flatpak Thunderbird (org.mozilla.Thunderbird) not found." >&2
+  exit 1
+fi
+
+profiles_ini="${FLATPAK_TB_DIR}/profiles.ini"
+if [[ ! -f "${profiles_ini}" ]]; then
+  echo "Error: ${profiles_ini} not found." >&2
+  exit 1
+fi
+
+find_active_profile() {
+  local active
+  active=$(python3 - "$profiles_ini" "$FLATPAK_TB_DIR" <<'PY'
+import configparser
+import sys
+from pathlib import Path
+
+ini = Path(sys.argv[1])
+base = Path(sys.argv[2])
+cp = configparser.ConfigParser()
+cp.read(ini)
+
+def resolve(path, is_relative=True):
+    p = Path(path)
+    return base / p if is_relative and not p.is_absolute() else p
+
+for section in cp.sections():
+    if section.startswith("Install"):
+        default = cp.get(section, "Default", fallback="")
+        if default:
+            print(resolve(default))
+            raise SystemExit(0)
+
+for section in cp.sections():
+    if section.startswith("Profile") and cp.get(section, "Default", fallback="") == "1":
+        path = cp.get(section, "Path", fallback="")
+        if path:
+            is_relative = cp.get(section, "IsRelative", fallback="1") == "1"
+            print(resolve(path, is_relative))
+            raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+  ) || return 1
+  [[ -n "${active}" ]] || return 1
+  printf '%s\n' "${active}"
+}
+
+profile="$(find_active_profile)" || {
+  echo "Error: could not determine active Thunderbird profile from ${profiles_ini}" >&2
+  exit 1
+}
+
+extensions_dir="${profile}/extensions"
+staged_dir="${extensions_dir}/staged/${EXTENSION_ID}"
+legacy_dir="${extensions_dir}/${EXTENSION_ID}"
+installed_xpi="${extensions_dir}/${EXTENSION_ID}.xpi"
+startup_cache="${profile}/addonStartup.json.lz4"
+
+if ! "${uninstall}" && [[ ! -f "${XPI}" ]]; then
+  echo "Error: XPI not found: ${XPI}" >&2
+  echo "Run ./bundle first." >&2
+  exit 1
+fi
+
+if flatpak ps --columns=application 2>/dev/null | grep -qx 'org.mozilla.Thunderbird'; then
+  if "${dry_run}"; then
+    echo "Would stop running Thunderbird: flatpak kill org.mozilla.Thunderbird"
+  else
+    echo "Stopping Thunderbird..."
+    flatpak kill org.mozilla.Thunderbird
+    sleep 2
+  fi
+fi
+
+echo "Profile: ${profile}"
+
+run rm -rf "${staged_dir}" "${legacy_dir}"
+run rm -f "${installed_xpi}" "${startup_cache}"
+
+if "${uninstall}"; then
+  echo "Removed sideloaded extension files."
+  echo "Restart Thunderbird to finish uninstalling."
+  exit 0
+fi
+
+run mkdir -p "${extensions_dir}"
+run cp "${XPI}" "${installed_xpi}"
+
+echo "Installed: ${installed_xpi}"
+echo
+echo "Restart Thunderbird, open Add-ons and Themes, and enable Thunderbird Review Actions if it loads disabled."

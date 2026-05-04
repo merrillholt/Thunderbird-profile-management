@@ -4,7 +4,7 @@ Last updated: 2026-05-04
 
 ## Current state
 
-Version 0.5.0. Source and XPI are in sync. Five actions: Approve sender, Trash sender, Trash domain, Route domain to folder, Mark junk. Native messaging host is implemented and integrated.
+Version 0.5.1. Source and XPI are in sync. Five actions: Approve sender, Trash sender, Trash domain, Route domain to folder, Mark junk. Native messaging host is implemented and integrated.
 
 ## Actions
 
@@ -26,8 +26,8 @@ Version 0.5.0. Source and XPI are in sync. Five actions: Approve sender, Trash s
 
 - **Route domain to folder** (`route-domain`)
   - Popup fetches local folder list via `get-local-folders` (excludes trash, junk, drafts, sent, outbox, templates by `folder.type`).
-  - User picks a folder; sends `{ type: "tbblock-route", domain, folder }` to native host, which appends `route @domain.com FolderName` to `blocked_domains.txt`. Run `tbblock-rebuild` to apply.
-  - If native host fails, popup shows fallback: `Run: tbblock --route @domain.com "FolderName"`.
+  - User picks a folder; sends `{ type: "tbblock-route", domain, folder }` using the Thunderbird folder path to native host, which appends `route @domain.com FolderPath` to `blocked_domains.txt`. Run `tbblock-rebuild` to apply.
+  - If native host fails, popup shows fallback: `Run: tbblock --route @domain.com "FolderPath"`.
 
 - **Mark junk** (`mark-junk`)
   - If in Review: marks inbox copies as junk, permanently deletes them, deletes Review copy.
@@ -61,6 +61,17 @@ flatpak override --user org.mozilla.Thunderbird --filesystem=/home/merrill/thund
 Do NOT use `--filesystem=home` — it shadows the Flatpak profile path (`~/.var/app/org.mozilla.Thunderbird/.thunderbird`) with `~/.thunderbird`, causing Thunderbird to start with a new empty profile.
 
 The native messaging host manifest and script directory are granted via `install-native-host`.
+
+## Permanent install notes
+
+- The local unsigned XPI can silently fail through **Install Add-on From File...**.
+- Permanent Flatpak install is handled by `install-review-actions`, which copies
+  the XPI to:
+  `~/.var/app/org.mozilla.Thunderbird/.thunderbird/<profile>/extensions/thunderbird-review-actions@merrill.local.xpi`
+- The script removes any empty staged directory for the same id and clears
+  `addonStartup.json.lz4` before restarting Thunderbird.
+- Thunderbird may load the sideloaded extension disabled; enable it in
+  **Add-ons and Themes**.
 
 ## Remaining work
 

@@ -651,4 +651,8 @@ EOF
 
 echo "${report}"
 echo "${report}" >> "${log_file}"
-[[ -n "${post_restore_notes}" ]] && echo "${post_restore_notes}"
+if [[ -n "${post_restore_notes}" ]]; then
+    echo "${post_restore_notes}"
+fi
+
+exit 0

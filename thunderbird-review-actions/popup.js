@@ -123,8 +123,8 @@ routeDomainButton.addEventListener("click", async () => {
     folderSelect.innerHTML = "";
     for (const f of response.folders) {
       const opt = document.createElement("option");
-      opt.value = f.name;
-      opt.textContent = f.name;
+      opt.value = f.path || f.name;
+      opt.textContent = f.label || f.path || f.name;
       folderSelect.appendChild(opt);
     }
     routePicker.style.display = "flex";

@@ -17,14 +17,18 @@ The --no-review flag overrides the marker for a single run.
 
 from __future__ import annotations
 
-import configparser
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+from thunderbird_profile import find_default_profile
+
 DOMAINS_FILE = Path(__file__).resolve().parent / "blocked_domains.txt"
-FLATPAK_TB_DIR = Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird"
+QUEUE_HEADER = (
+    "# Pending domain block changes. Managed by tbblock.\n"
+    "# Run tbblock-rebuild to apply. File is cleared after apply.\n"
+)
 FILTER_NAME = "[TBQ] Blocked domains -> Trash"
 INSERT_AFTER = "[TBQ] Trash senders -> Trash"
 FALLBACK_BEFORE = "[TBQ] Spoofed trusted domains -> Spoofed"
@@ -35,33 +39,7 @@ NO_REVIEW_MARKER = Path.home() / ".config/tbblock/no-review"
 
 
 def find_profile() -> Path:
-    ini = FLATPAK_TB_DIR / "profiles.ini"
-    if ini.exists():
-        cp = configparser.ConfigParser()
-        cp.read(ini)
-
-        def resolve(rel: str, is_relative: bool) -> Path:
-            return FLATPAK_TB_DIR / rel if is_relative else Path(rel)
-
-        # [Install*] sections reflect the per-install active profile; check these first.
-        for section in cp.sections():
-            if section.startswith("Install"):
-                rel = cp.get(section, "default", fallback="")
-                if rel:
-                    return resolve(rel, is_relative=True)
-
-        # Fall back to the profile with Default=1.
-        for section in cp.sections():
-            if cp.get(section, "default", fallback="") == "1":
-                rel = cp.get(section, "path", fallback="")
-                if rel:
-                    is_relative = cp.get(section, "isrelative", fallback="1") == "1"
-                    return resolve(rel, is_relative)
-
-    candidates = sorted(FLATPAK_TB_DIR.glob("*.default*"))
-    if candidates:
-        return candidates[0]
-    raise RuntimeError(f"No Thunderbird profile found in {FLATPAK_TB_DIR}")
+    return find_default_profile()
 
 
 def is_tb_running() -> bool:
@@ -84,7 +62,7 @@ def read_queue() -> tuple[dict[str, str], dict[str, str | None]]:
 
     Returns:
         blocks: {domain: "add" | "delete"}   — last action wins per domain
-        routes: {domain: folder_name | None} — None means unroute; last action wins
+        routes: {domain: folder_ref | None}  — None means unroute; last action wins
     """
     if not DOMAINS_FILE.exists():
         return {}, {}
@@ -106,10 +84,14 @@ def read_queue() -> tuple[dict[str, str], dict[str, str | None]]:
 
 
 def clear_queue() -> None:
-    DOMAINS_FILE.write_text(
-        "# Pending domain block changes. Managed by tbblock.\n"
-        "# Run tbblock-rebuild to apply. File is cleared after apply.\n"
-    )
+    DOMAINS_FILE.write_text(QUEUE_HEADER)
+
+
+def write_remaining_queue(routes: dict[str, str]) -> None:
+    lines = [QUEUE_HEADER]
+    for domain, folder in sorted(routes.items()):
+        lines.append(f"route {domain} {folder}\n")
+    DOMAINS_FILE.write_text("".join(lines))
 
 
 def parse_blocks(content: str) -> tuple[str, list[str]]:
@@ -163,13 +145,35 @@ def get_filter_domains(path: Path) -> set[str]:
     return set(extract_domains(blocks[idx])) if idx is not None else set()
 
 
-def find_local_folder_uri(profile: Path, folder_name: str) -> str | None:
-    mbox = profile / "Mail" / "Local Folders" / folder_name
-    return f"mailbox://{mbox}" if mbox.exists() else None
+def folder_ref_parts(folder_ref: str) -> list[str]:
+    ref = folder_ref.strip()
+    if not ref:
+        return []
+    parts = [p for p in ref.strip("/").split("/") if p]
+    if parts and parts[0] == "Local Folders":
+        parts = parts[1:]
+    if any(p in {".", ".."} for p in parts):
+        return []
+    return parts
 
 
-def make_route_filter_block(folder_name: str, folder_uri: str, condition: str) -> str:
-    name = f"{ROUTE_FILTER_PREFIX}{folder_name}"
+def local_folder_mbox_path(profile: Path, folder_ref: str) -> Path | None:
+    parts = folder_ref_parts(folder_ref)
+    if not parts:
+        return None
+    mbox = profile / "Mail" / "Local Folders" / parts[0]
+    for part in parts[1:]:
+        mbox = mbox.with_name(mbox.name + ".sbd") / part
+    return mbox
+
+
+def find_local_folder_uri(profile: Path, folder_ref: str) -> str | None:
+    mbox = local_folder_mbox_path(profile, folder_ref)
+    return f"mailbox://{mbox}" if mbox and mbox.exists() else None
+
+
+def make_route_filter_block(folder_ref: str, folder_uri: str, condition: str) -> str:
+    name = f"{ROUTE_FILTER_PREFIX}{folder_ref}"
     return (
         f'name="{name}"\n'
         f'enabled="yes"\n'
@@ -181,7 +185,7 @@ def make_route_filter_block(folder_name: str, folder_uri: str, condition: str) -
 
 
 def get_all_route_domains(path: Path) -> dict[str, set[str]]:
-    """Return {folder_name: {domain, …}} from all [TBQ] Route -> * filters."""
+    """Return {folder_ref: {domain, …}} from all [TBQ] Route -> * filters."""
     _, blocks = parse_blocks(path.read_text())
     result: dict[str, set[str]] = {}
     for b in blocks:
@@ -193,7 +197,7 @@ def get_all_route_domains(path: Path) -> dict[str, set[str]]:
 
 
 def get_all_route_domains_flat(path: Path) -> dict[str, str]:
-    """Return {domain: folder_name} from all route filters in one file."""
+    """Return {domain: folder_ref} from all route filters in one file."""
     flat: dict[str, str] = {}
     for folder, domains in get_all_route_domains(path).items():
         for d in domains:
@@ -204,26 +208,36 @@ def get_all_route_domains_flat(path: Path) -> dict[str, str]:
 def write_route_filters(path: Path, routes: dict[str, set[str]], profile: Path) -> None:
     """Write (or remove) all [TBQ] Route -> * filters.
 
-    routes: {folder_name: {domain, …}} — complete desired state.
+    routes: {folder_ref: {domain, …}} — complete desired state.
     """
     content = path.read_text()
     header, blocks = parse_blocks(content)
 
-    # Remove all existing route filters.
-    blocks = [b for b in blocks if not block_name(b).startswith(ROUTE_FILTER_PREFIX)]
+    # Preserve route filters whose target folder cannot currently be resolved.
+    # This prevents a missing local folder from deleting previously working
+    # route state while still allowing valid route changes to be rebuilt.
+    kept_blocks: list[str] = []
+    for b in blocks:
+        name = block_name(b)
+        if not name.startswith(ROUTE_FILTER_PREFIX):
+            kept_blocks.append(b)
+            continue
+        folder_ref = name[len(ROUTE_FILTER_PREFIX):]
+        if find_local_folder_uri(profile, folder_ref) is None:
+            kept_blocks.append(b)
+    blocks = kept_blocks
 
     # Build new route filter blocks in sorted folder order.
     new_route_blocks: list[str] = []
-    for folder_name in sorted(routes):
-        domains = routes[folder_name]
+    for folder_ref in sorted(routes):
+        domains = routes[folder_ref]
         if not domains:
             continue
-        uri = find_local_folder_uri(profile, folder_name)
+        uri = find_local_folder_uri(profile, folder_ref)
         if uri is None:
-            print(f"  Warning: local folder not found: {folder_name!r} — skipping", file=sys.stderr)
             continue
         new_route_blocks.append(
-            make_route_filter_block(folder_name, uri, build_condition(sorted(domains)))
+            make_route_filter_block(folder_ref, uri, build_condition(sorted(domains)))
         )
 
     if new_route_blocks:
@@ -441,12 +455,21 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
     for path in filter_files:
         all_current_routes.update(get_all_route_domains_flat(path))
 
-    routes_to_set    = {d: f for d, f in net_routes.items()
+    missing_route_targets = {
+        d: f for d, f in net_routes.items()
+        if find_local_folder_uri(profile, f) is None
+    }
+    valid_net_routes = {
+        d: f for d, f in net_routes.items()
+        if d not in missing_route_targets
+    }
+
+    routes_to_set    = {d: f for d, f in valid_net_routes.items()
                         if all_current_routes.get(d) != f}
     routes_to_delete = sorted(d for d in net_unroutes if d in all_current_routes)
     routes_not_found = sorted(d for d in net_unroutes if d not in all_current_routes)
 
-    final_routes_flat: dict[str, str] = {**all_current_routes, **net_routes}
+    final_routes_flat: dict[str, str] = {**all_current_routes, **valid_net_routes}
     for d in net_unroutes:
         final_routes_flat.pop(d, None)
     final_routes: dict[str, set[str]] = {}
@@ -460,6 +483,11 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
             print(f"  + {d} -> {f}")
         if not routes_to_set:
             print("  (none)")
+
+        if missing_route_targets:
+            print(f"Route — Deferred ({len(missing_route_targets)}):")
+            for d, f in sorted(missing_route_targets.items()):
+                print(f"  ! {d} -> {f}  (local folder not found — queue entry kept)")
 
         total_unroute = len(routes_to_delete) + len(routes_not_found)
         print(f"Route — Remove ({total_unroute}):")
@@ -485,7 +513,10 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
     if not any_change:
         print("No filter changes needed." + (" (dry run)" if dry_run else ""))
         if not dry_run:
-            clear_queue()
+            if missing_route_targets:
+                write_remaining_queue(missing_route_targets)
+            else:
+                clear_queue()
         return 0
 
     if dry_run:
@@ -536,7 +567,10 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
             print(f"  {account}: updated ({', '.join(parts)}{suffix})")
 
     if has_queue:
-        clear_queue()
+        if missing_route_targets:
+            write_remaining_queue(missing_route_targets)
+        else:
+            clear_queue()
     print()
     print("Done. Start Thunderbird to load the updated filters.")
     return 0

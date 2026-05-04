@@ -31,14 +31,17 @@ tbblock --delete @domain.com
 The target folder must exist in Thunderbird before applying.
 
 1. Create the folder in Thunderbird (right-click Local Folders → New Folder).
-2. Queue the route:
+2. Queue the route. Top-level folders can use their folder name; nested folders
+   should use the Thunderbird folder path:
    ```bash
    tbblock --route @domain.com FolderName
+   tbblock --route @domain.com Parent/Child
    ```
 3. Apply (see below).
 4. Back up and restore on all other machines (see below) — the new folder propagates with the backup.
 
-If `tbblock-rebuild` warns `local folder not found`, the folder does not exist yet in the profile. Create it in Thunderbird and re-run.
+If `tbblock-rebuild` shows the route as deferred because the local folder was
+not found, the route stays queued. Create the folder in Thunderbird and re-run.
 
 ### Remove a domain route
 
@@ -178,6 +181,12 @@ The script is idempotent — it skips symlinks that are already correct and only
    ```bash
    install-native-host
    ```
+8. On the review system, install the review actions extension permanently:
+   ```bash
+   install-review-actions
+   ```
+   Restart Thunderbird, open **Add-ons and Themes**, and enable
+   **Thunderbird Review Actions** if it loads disabled.
 
 ---
 
@@ -212,6 +221,11 @@ tbblock-rebuild                    # re-disables catch-all (no-review marker alr
 ## Review folder actions
 
 The **thunderbird-review-actions** extension is designed for use on the review system. Actions that modify address books (Whitelist, Trash Senders) write to local profile files and will be overwritten by the next `thunderbird-restore` on any other machine — so those actions are only meaningful on the review system.
+
+For permanent install/update instructions, see
+`thunderbird-review-actions/README.md`. After sideloading the XPI, Thunderbird
+may show the extension as disabled on first startup; enable it in **Add-ons and
+Themes**.
 
 On the **review system**, with a message open in `Local Folders/Review`:
 

@@ -31,11 +31,25 @@ def message_key(msg) -> str:
 
 
 def mbox_files(directory: Path) -> list[Path]:
-    """Return regular mbox files in a Local Folders directory (no .msf, no dirs)."""
+    """Return regular mbox files under a Local Folders tree."""
     if not directory.is_dir():
         return []
-    return sorted(p for p in directory.iterdir()
-                  if p.is_file() and p.suffix != ".msf")
+    return sorted(
+        p
+        for p in directory.rglob("*")
+        if p.is_file() and p.suffix != ".msf"
+    )
+
+
+def display_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
+
+
+def msf_path(mbox_path: Path) -> Path:
+    return mbox_path.parent / (mbox_path.name + ".msf")
 
 
 def read_keys(path: Path) -> set[str]:
@@ -56,7 +70,8 @@ def cmd_snapshot(src_dir: Path, dest_dir: Path, work_dir: Path) -> int:
     total = 0
     folders = 0
     for dest_mbox in mbox_files(dest_dir):
-        src_mbox = src_dir / dest_mbox.name
+        rel_path = dest_mbox.relative_to(dest_dir)
+        src_mbox = src_dir / rel_path
         src_keys = read_keys(src_mbox) if src_mbox.exists() else set()
         unique: list[mailbox.mboxMessage] = []
         try:
@@ -66,17 +81,19 @@ def cmd_snapshot(src_dir: Path, dest_dir: Path, work_dir: Path) -> int:
                     unique.append(msg)
             mb.close()
         except Exception as e:
-            print(f"  Warning: could not read {dest_mbox.name}: {e}", file=sys.stderr)
+            print(f"  Warning: could not read {display_path(dest_mbox, dest_dir)}: {e}", file=sys.stderr)
             continue
         if unique:
-            out = mailbox.mbox(str(work_dir / dest_mbox.name), create=True)
+            saved_mbox = work_dir / rel_path
+            saved_mbox.parent.mkdir(parents=True, exist_ok=True)
+            out = mailbox.mbox(str(saved_mbox), create=True)
             for msg in unique:
                 out.add(msg)
             out.flush()
             out.close()
             total += len(unique)
             folders += 1
-            print(f"  {dest_mbox.name}: {len(unique)} message(s) to preserve")
+            print(f"  {rel_path}: {len(unique)} message(s) to preserve")
     if total:
         print(f"  Total: {total} message(s) across {folders} folder(s)")
     else:
@@ -92,7 +109,8 @@ def cmd_merge(dest_dir: Path, work_dir: Path) -> int:
         return 0
     total = 0
     for saved_mbox in saved:
-        dest_mbox = dest_dir / saved_mbox.name
+        rel_path = saved_mbox.relative_to(work_dir)
+        dest_mbox = dest_dir / rel_path
         existing = read_keys(dest_mbox) if dest_mbox.exists() else set()
         to_add: list[mailbox.mboxMessage] = []
         try:
@@ -102,24 +120,25 @@ def cmd_merge(dest_dir: Path, work_dir: Path) -> int:
                     to_add.append(msg)
             mb.close()
         except Exception as e:
-            print(f"  Warning: could not read saved {saved_mbox.name}: {e}", file=sys.stderr)
+            print(f"  Warning: could not read saved {rel_path}: {e}", file=sys.stderr)
             continue
         if not to_add:
             continue
         try:
+            dest_mbox.parent.mkdir(parents=True, exist_ok=True)
             dst = mailbox.mbox(str(dest_mbox), create=True)
             for msg in to_add:
                 dst.add(msg)
             dst.flush()
             dst.close()
         except Exception as e:
-            print(f"  Warning: could not write {dest_mbox.name}: {e}", file=sys.stderr)
+            print(f"  Warning: could not write {rel_path}: {e}", file=sys.stderr)
             continue
-        msf = dest_mbox.with_suffix(".msf")
+        msf = msf_path(dest_mbox)
         if msf.exists():
             msf.unlink()
         total += len(to_add)
-        print(f"  {dest_mbox.name}: merged {len(to_add)} message(s)")
+        print(f"  {rel_path}: merged {len(to_add)} message(s)")
     if total:
         print(f"  Total merged: {total} message(s)")
     else:
