@@ -116,6 +116,21 @@ Note: `blocked_domains.txt` lives in the pCloud script directory, not the profil
 
 ---
 
+## Re-running install after updates
+
+The repo syncs to all machines automatically via pCloud, but `~/bin` symlinks and systemd timers do not update themselves. Re-run `install` on each machine when:
+
+- New scripts are added to the toolset (new symlinks needed)
+- Systemd unit files are changed (timers need reloading)
+
+```bash
+./install
+```
+
+The script is idempotent — it skips symlinks that are already correct and only updates what has changed.
+
+---
+
 ## Setting up a new machine
 
 1. Install Thunderbird and launch it once to create a profile.
