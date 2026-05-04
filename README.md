@@ -175,12 +175,12 @@ The **thunderbird-review-actions** extension is designed for use on the review s
 On the **review system**, with a message open in `Local Folders/Review`:
 
 - **Approve sender** — adds sender to the Whitelist; deletes the Review copy. Back up afterwards to propagate the whitelist change.
-- **Mark as Trash** — adds sender to Trash Senders; tags the inbox copy `trash` (auto-deleted after 30 days); deletes the Review copy. Back up afterwards.
-- **Mark as Trash (domain)** — same as above, and queues the whole domain in `blocked_domains.txt` for `tbblock-rebuild`. The queue entry survives restores.
-- **Mark as Junk** — marks the inbox copy as junk and permanently deletes both copies.
-- **Route domain** — queues a domain-to-folder route in `blocked_domains.txt` for `tbblock-rebuild`.
+- **Trash sender** — adds sender to Trash Senders; tags the inbox copy `trash` (auto-deleted after 30 days); deletes the Review copy. Back up afterwards.
+- **Trash domain** — same as above, and queues the whole domain in `blocked_domains.txt` for `tbblock-rebuild`. The queue entry survives restores.
+- **Mark junk** — marks the inbox copy as junk and permanently deletes both copies.
+- **Route domain to folder** — queues a domain-to-folder route in `blocked_domains.txt` for `tbblock-rebuild`.
 
-On a **non-review machine** the extension has no Review folder to process. The only actions that are durable across restores are **Mark as Junk** (acts on IMAP server state) and the two domain-queue actions (**Mark as Trash (domain)**, **Route domain**), since they write to the pCloud-synced `blocked_domains.txt` rather than the profile.
+On a **non-review machine** the extension has no Review folder to process. The only actions that are durable across restores are **Mark junk** (acts on IMAP server state) and the two domain-queue actions (**Trash domain**, **Route domain to folder**), since they write to the pCloud-synced `blocked_domains.txt` rather than the profile.
 
 ---
 

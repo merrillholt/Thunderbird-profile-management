@@ -88,7 +88,7 @@ These rules identify trusted senders and tag `tbq_identified` to prevent them fr
 
 If the sender is in the Trash Senders address book (`abook-3.sqlite`), the message is tagged `trash` and `tbq_identified` and stops. The message remains in the inbox and is **deleted after 30 days** by a periodic rule. These messages are never copied to Review.
 
-Senders are added to the Trash Senders list via the **mark as trash** and **mark as trash (domain)** review actions (see below).
+Senders are added to the Trash Senders list via the **trash sender** and **trash domain** review actions (see below).
 
 ## Blocked Domains
 
@@ -121,27 +121,27 @@ Thunderbird's built-in junk filter may tag arriving messages as junk. No filter 
 
 Messages in Local Folders/Review are processed using the **thunderbird-review-actions** extension. Five actions are available:
 
-### Approve Sender
+### Approve sender
 - Adds the sender to the Whitelist address book (`abook-2.sqlite`)
 - Permanently deletes the Review copy
 - Future messages from this sender will pass through without going to Review
 
-### Mark as Trash
+### Trash sender
 - Adds the `trash` tag to the original inbox copy (triggering 30-day deletion)
 - Adds the sender to the Trash Senders address book so future messages are handled automatically
 - Permanently deletes the Review copy
 
-### Mark as Trash (domain)
-- Same as Mark as Trash (sender address book entry + trash tag on inbox copy + delete Review copy)
+### Trash domain
+- Same as Trash sender (sender address book entry + trash tag on inbox copy + delete Review copy)
 - Additionally queues the sender's entire domain in `blocked_domains.txt` via the native messaging host
 - Run `tbblock-rebuild` (Thunderbird closed) to apply the domain filter to all account filter files
 
-### Route Domain to Folder
+### Route domain to folder
 - Queues a domain-to-folder route in `blocked_domains.txt` via the native messaging host
 - Run `tbblock-rebuild` to apply; future mail from that domain is copied to the specified Local Folder instead of going to Review
 - The target Local Folder must exist before `tbblock-rebuild` runs
 
-### Mark as Junk
+### Mark junk
 - Marks the inbox copy as junk and permanently deletes it
 - Permanently deletes the Review copy
 

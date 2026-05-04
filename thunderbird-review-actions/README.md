@@ -9,7 +9,7 @@ The popup appears on any displayed message and shows five actions. When the mess
 - **Approve sender** — adds the sender to the `Whitelist` address book. If in Review, deletes the Review copy; the inbox original is left untouched.
 - **Trash sender** — adds the sender to `Trash Senders` and (if in Review) tags the inbox copy `trash` then deletes the Review copy. Outside Review, tags the displayed message `trash`. The existing 30-day cleanup filter removes trash-tagged messages later.
 - **Trash domain** — same as Trash sender, and additionally queues the sender's domain in `blocked_domains.txt` via the native messaging host. The popup shows the result and prompts to run `tbblock-rebuild` to apply.
-- **Route domain to folder** — opens a folder picker populated from Local Folders, then queues a domain-to-folder route in `blocked_domains.txt` via the native messaging host. Run `tbblock-rebuild` to apply.
+- **Route domain to folder** — opens a folder picker populated from Local Folders, then queues a domain-to-folder route in `blocked_domains.txt` via the native messaging host. The target folder must exist in Thunderbird before `tbblock-rebuild` is run. Run `tbblock-rebuild` to apply.
 - **Mark junk** — if in Review, marks the inbox copy as junk, permanently deletes it, and deletes the Review copy. Outside Review, marks and immediately deletes the displayed message.
 
 ## Assumptions
@@ -19,7 +19,7 @@ The popup appears on any displayed message and shows five actions. When the mess
 - Trash Senders address book is named `Trash Senders`.
 - Existing filters **copy** (not move) messages to Review — originals remain in the inbox.
 - Existing cleanup filters delete `trash`-tagged messages after 30 days.
-- The native messaging host (`tbblock`) is installed via `install-native-host`.
+- The native messaging host (`tbblock`) is installed on the review system via `install-native-host`.
 
 ## Building the XPI
 
