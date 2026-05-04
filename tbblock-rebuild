@@ -43,13 +43,25 @@ def find_profile() -> Path:
 
 
 def is_tb_running() -> bool:
-    for pattern in ("org.mozilla.Thunderbird", "thunderbird-bin", "thunderbird"):
+    for process_name in ("thunderbird-bin", "thunderbird"):
         try:
-            r = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
+            r = subprocess.run(["pgrep", "-x", process_name], capture_output=True)
             if r.returncode == 0:
                 return True
         except FileNotFoundError:
             pass
+
+    try:
+        r = subprocess.run(
+            ["flatpak", "ps", "--columns=application"],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode == 0 and "org.mozilla.Thunderbird" in r.stdout.splitlines():
+            return True
+    except FileNotFoundError:
+        pass
+
     return False
 
 
