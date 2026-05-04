@@ -15,8 +15,9 @@ Filters run top to bottom on each new arriving message. The first matching rule 
 1. Specific category rules (copy to local folder)
 2. Whitelist / CardBook / trusted-domain pass-through rules
 3. Trash sender rule
-4. Spoofed-domain quarantine
-5. Catch-all quarantine to Review
+4. Blocked domains rule
+5. Spoofed-domain quarantine
+6. Catch-all quarantine to Review
 
 ## Specific Category Rules (Important Emails)
 
@@ -89,6 +90,12 @@ If the sender is in the Trash Senders address book (`abook-3.sqlite`), the messa
 
 Senders are added to the Trash Senders list via the **mark as trash** review action (see below).
 
+## Blocked Domains
+
+If the sender's domain matches any entry in the `[TBQ] Blocked domains -> Trash` filter, the message is tagged `trash` and `tbq_identified` and execution stops. The message remains in the inbox and is **deleted after 30 days** by the periodic trash rule. No copy is made to Review.
+
+Domains are managed via `tbblock --add` / `tbblock --delete` and applied by `tbblock-rebuild`. The filter is inserted after the Trash senders rule and before the Spoofed-domain rule.
+
 ## Spoofed Trusted Domains
 
 If the from address claims to be from a trusted domain (`@gmail.com`, `@bluerug.org`, `@comcast.net`, `@milesweb.com`) but fails all of DMARC, DKIM, SPF, and received-SPF, the message is **moved** (not copied) to Local Folders/Spoofed and tagged `tbq_identified`. The message is removed from the inbox.
@@ -96,6 +103,8 @@ If the from address claims to be from a trusted domain (`@gmail.com`, `@bluerug.
 ## Catch-All Quarantine
 
 Any message that has not yet been tagged `tbq_identified` by a prior rule is copied to Local Folders/Review, tagged `tbq_identified`, and execution stops. The original remains in the inbox.
+
+This filter is active only on the **review system**. On all other machines it is disabled by `tbblock-rebuild` (controlled by the presence of `~/.config/tbblock/no-review`), so unrecognised mail stays in the inbox rather than being intercepted before the review system sees it.
 
 ## Periodic Rules (gmail and bluerug only)
 
@@ -110,21 +119,31 @@ Thunderbird's built-in junk filter may tag arriving messages as junk. No filter 
 
 ## Review Folder Actions
 
-Messages in Local Folders/Review are processed using the **thunderbird-review-actions** extension. Three actions are available:
+Messages in Local Folders/Review are processed using the **thunderbird-review-actions** extension. Five actions are available:
+
+### Approve Sender
+- Adds the sender to the Whitelist address book (`abook-2.sqlite`)
+- Permanently deletes the Review copy
+- Future messages from this sender will pass through without going to Review
 
 ### Mark as Trash
 - Adds the `trash` tag to the original inbox copy (triggering 30-day deletion)
 - Adds the sender to the Trash Senders address book so future messages are handled automatically
 - Permanently deletes the Review copy
 
+### Mark as Trash (domain)
+- Same as Mark as Trash (sender address book entry + trash tag on inbox copy + delete Review copy)
+- Additionally queues the sender's entire domain in `blocked_domains.txt` via the native messaging host
+- Run `tbblock-rebuild` (Thunderbird closed) to apply the domain filter to all account filter files
+
+### Route Domain to Folder
+- Queues a domain-to-folder route in `blocked_domains.txt` via the native messaging host
+- Run `tbblock-rebuild` to apply; future mail from that domain is copied to the specified Local Folder instead of going to Review
+- The target Local Folder must exist before `tbblock-rebuild` runs
+
 ### Mark as Junk
 - Marks the inbox copy as junk and permanently deletes it
 - Permanently deletes the Review copy
-
-### Approve Sender
-- Adds the sender to the Whitelist address book (`abook-2.sqlite`)
-- Permanently deletes the Review copy
-- Future messages from this sender will pass through without going to Review
 
 ## Tags Reference
 
