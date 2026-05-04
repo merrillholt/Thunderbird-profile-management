@@ -88,7 +88,7 @@ These rules identify trusted senders and tag `tbq_identified` to prevent them fr
 
 If the sender is in the Trash Senders address book (`abook-3.sqlite`), the message is tagged `trash` and `tbq_identified` and stops. The message remains in the inbox and is **deleted after 30 days** by a periodic rule. These messages are never copied to Review.
 
-Senders are added to the Trash Senders list via the **mark as trash** review action (see below).
+Senders are added to the Trash Senders list via the **mark as trash** and **mark as trash (domain)** review actions (see below).
 
 ## Blocked Domains
 
