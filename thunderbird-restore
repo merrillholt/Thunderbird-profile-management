@@ -9,19 +9,25 @@ dry_run=false
 self_test=false
 self_test_root=""
 no_merge=false
+check=false
 merge_work_dir=""
 merge_status="Skipped"
+manifest_date=""
+
+LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
 
 trap '[[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"' EXIT
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test]
+Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test] [--check]
 
 Options:
   --dry-run    Show what would be restored without making changes
   --no-merge   Replace local folders entirely (skip message-level merge)
   --self-test  Run a safe self-test using temporary data
+  --check      Check if a restore is needed without restoring
+               Exit 0 = up to date, 1 = restore needed, 2 = unknown
   -h, --help   Show this help
 EOF
 }
@@ -31,6 +37,7 @@ for arg in "$@"; do
         --dry-run) dry_run=true ;;
         --no-merge) no_merge=true ;;
         --self-test) self_test=true ;;
+        --check) check=true ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "Error: Unknown option: ${arg}" >&2
@@ -103,6 +110,35 @@ fi
 backup_root="$(dirname "${src%/}")"
 profile_root_src="${backup_root}/profile-root"
 metadata_src="${backup_root}/metadata"
+
+# ── upgrade check ─────────────────────────────────────────────────────────────
+if "${check}"; then
+    manifest_file="${src}/.backup_manifest"
+    if [[ -f "${manifest_file}" ]]; then
+        manifest_date=$(awk -F= '/^date=/{print $2}' "${manifest_file}")
+    fi
+    last_restore=""
+    if [[ -f "${LAST_RESTORE_FILE}" ]]; then
+        last_restore=$(cat "${LAST_RESTORE_FILE}")
+    fi
+
+    printf 'Backup date:   %s\n' "${manifest_date:-(unknown)}"
+    printf 'Last restore:  %s\n' "${last_restore:-(never)}"
+
+    if [[ -z "${manifest_date}" ]]; then
+        echo "Status:        Unknown (backup manifest not found)"
+        exit 2
+    elif [[ -z "${last_restore}" ]]; then
+        echo "Status:        Restore needed (never restored on this machine)"
+        exit 1
+    elif [[ "${last_restore}" < "${manifest_date}" ]]; then
+        echo "Status:        Restore needed (backup is newer than last restore)"
+        exit 1
+    else
+        echo "Status:        Up to date"
+        exit 0
+    fi
+fi
 
 run_quick_check() {
     if command -v timeout >/dev/null 2>&1; then
@@ -357,6 +393,7 @@ else
         echo "Error: Backup manifest appears invalid: ${manifest_file}" >&2
         exit 1
     fi
+    manifest_date=$(awk -F= '/^date=/{print $2}' "${manifest_file}")
     manifest_tb_type=$(awk -F= '/^thunderbird=/{print $2}' "${manifest_file}")
     manifest_tb_version=$(awk -F= '/^thunderbird_version=/{print $2}' "${manifest_file}")
     manifest_profile=$(awk -F= '/^profile=/{print $2}' "${manifest_file}")
@@ -450,6 +487,12 @@ else
     fi
 
     reset_profile_runtime_state "${dest%/}"
+
+    # Record restore timestamp for upgrade check
+    if [[ -n "${manifest_date}" ]]; then
+        mkdir -p "$(dirname "${LAST_RESTORE_FILE}")"
+        printf '%s\n' "${manifest_date}" > "${LAST_RESTORE_FILE}"
+    fi
 fi
 [[ -n "${tmp_dry_dest}" ]] && rm -rf "${tmp_dry_dest}"
 end_time=$(date +%s)

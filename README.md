@@ -116,6 +116,31 @@ Note: `blocked_domains.txt` lives in the pCloud script directory, not the profil
 
 ---
 
+## Checking if a restore is needed
+
+After each successful restore, `thunderbird-restore` records the backup date in `~/.config/tbblock/last-restore`. To check whether the current backup is newer than the last restore on this machine:
+
+```bash
+thunderbird-restore --check
+```
+
+Output:
+```
+Backup date:   2026-05-04 14:30:00
+Last restore:  2026-05-03 09:15:00
+Status:        Restore needed (backup is newer than last restore)
+```
+
+Exit codes: `0` = up to date, `1` = restore needed, `2` = cannot determine. Usable in scripts:
+
+```bash
+thunderbird-restore --check || thunderbird-restore
+```
+
+The check only requires pCloud to be mounted — it does not inspect the local Thunderbird profile.
+
+---
+
 ## Re-running install after updates
 
 The repo syncs to all machines automatically via pCloud, but `~/bin` symlinks and systemd timers do not update themselves. Re-run `install` on each machine when:
