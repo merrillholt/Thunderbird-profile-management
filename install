@@ -72,6 +72,41 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
     exit 1
 fi
 
+# ── dependency check ──────────────────────────────────────────────────────────
+
+check_deps() {
+    local -a deps=(python3 rsync restic flock sqlite3 age zip)
+    local -A dep_users=(
+        [python3]="tbblock-rebuild, thunderbird-restore, thunderbird-dedup-local, thunderbird-mbox-merge, tbblock-native-host, tbq-filter-audit"
+        [rsync]="thunderbird-backup, thunderbird-restore"
+        [restic]="thunderbird-localfolders-backup"
+        [flock]="tbblock, tbblock-native-host"
+        [sqlite3]="tbq-filter-audit"
+        [age]="tbq-filter-audit"
+        [zip]="bundle"
+    )
+
+    local missing=()
+    for dep in "${deps[@]}"; do
+        command -v "$dep" &>/dev/null || missing+=("$dep")
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return
+    fi
+
+    echo "Warning: the following dependencies are missing:"
+    for dep in "${missing[@]}"; do
+        printf "  %-12s  needed by: %s\n" "$dep" "${dep_users[$dep]}"
+    done
+    echo "Install missing packages before using the affected tools."
+    echo
+}
+
+if ! "${uninstall}"; then
+    check_deps
+fi
+
 # Ensure ~/bin exists.
 if [[ ! -d "${BIN_DIR}" ]]; then
     if "${dry_run}"; then
