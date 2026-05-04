@@ -88,6 +88,7 @@ thunderbird-backup
 **On each other machine:**
 
 ```bash
+thunderbird-restore --check        # confirm restore is needed first
 # Close Thunderbird first, then:
 thunderbird-restore
 tbblock-rebuild                    # re-disables catch-all on non-review machines
@@ -256,6 +257,7 @@ restic -r ~/pcloud/"Thunderbird Backup"/localfolders-restic restore <snapshot-id
 ## Audit and diagnostics
 
 ```bash
+thunderbird-restore --check        # check if backup is newer than last restore
 thunderbird-audit                  # inspect profiles, detect orphans
 thunderbird-audit --fix            # interactive cleanup (use with care)
 tbblock-rebuild --list             # show role, catch-all state, blocked domains, routes
