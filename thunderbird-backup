@@ -19,6 +19,30 @@ Options:
 EOF
 }
 
+run_rsync_capture() {
+    local output status
+
+    set +e
+    output=$("$@" 2>&1)
+    status=$?
+    set -e
+
+    case "${status}" in
+        0)
+            ;;
+        24)
+            echo "Warning: rsync reported vanished source files (exit code 24)." >&2
+            echo "This usually means the Thunderbird profile changed during backup; rerun once Thunderbird is fully closed if anything looks incomplete." >&2
+            ;;
+        *)
+            printf '%s\n' "${output}" >&2
+            return "${status}"
+            ;;
+    esac
+
+    printf '%s\n' "${output}"
+}
+
 for arg in "$@"; do
     case "${arg}" in
         --dry-run) dry_run=true ;;
@@ -302,10 +326,10 @@ if "${dry_run}" && [[ ! -d "${dest}" ]]; then
 fi
 
 if "${dry_run}"; then
-    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --delete --stats --dry-run "${src}" "${rsync_dest}")
+    rsync_output=$(run_rsync_capture rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --delete --delete-excluded --stats --dry-run "${src}" "${rsync_dest}")
 else
     mkdir -p "${dest}"
-    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --delete --stats "${src}" "${dest}")
+    rsync_output=$(run_rsync_capture rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --delete --delete-excluded --stats "${src}" "${dest}")
     mkdir -p "${profile_root_dest}" "${metadata_dest}"
     for root_file in profiles.ini installs.ini; do
         if [[ -f "${tb_dir}/${root_file}" ]]; then
@@ -370,7 +394,7 @@ if "${dry_run}"; then
     file_count="${total_files:-n/a}"
 else
     backup_size=$(du -sh "${backup_root}" | cut -f1)
-    file_count=$(find "${backup_root}" -type f | wc -l)
+    file_count=$(find "${dest}" -type f | wc -l)
 fi
 
 # Write simple manifest for restore validation

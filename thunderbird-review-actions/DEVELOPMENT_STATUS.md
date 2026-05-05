@@ -55,7 +55,7 @@ Version 0.5.1. Source and XPI are in sync. Five actions: Approve sender, Trash s
 For temporary add-on loading during development, grant filesystem access to the source directory:
 
 ```bash
-flatpak override --user org.mozilla.Thunderbird --filesystem=/home/merrill/thunderbird-review-actions
+flatpak override --user org.mozilla.Thunderbird --filesystem=/mnt/pcloud/bin/thunderbird-tools
 ```
 
 Do NOT use `--filesystem=home` — it shadows the Flatpak profile path (`~/.var/app/org.mozilla.Thunderbird/.thunderbird`) with `~/.thunderbird`, causing Thunderbird to start with a new empty profile.

@@ -18,6 +18,30 @@ LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
 
 trap '[[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"' EXIT
 
+run_rsync_capture() {
+    local output status
+
+    set +e
+    output=$("$@" 2>&1)
+    status=$?
+    set -e
+
+    case "${status}" in
+        0)
+            ;;
+        24)
+            echo "Warning: rsync reported vanished source files (exit code 24)." >&2
+            echo "This usually means the backup tree changed during restore; rerun once pCloud is fully synced if anything looks incomplete." >&2
+            ;;
+        *)
+            printf '%s\n' "${output}" >&2
+            return "${status}"
+            ;;
+    esac
+
+    printf '%s\n' "${output}"
+}
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test] [--check]
@@ -61,6 +85,7 @@ setup_self_test() {
     tb_dir="${root}/tb"
     src="${root}/backup/${backup_root_rel}/thunderbird/"
     log_file="${root}/thunderbird-restore.log"
+    LAST_RESTORE_FILE="${root}/config/tbblock/last-restore"
 
     mkdir -p "${tb_dir}/restore.target"
     cat <<EOF > "${tb_dir}/profiles.ini"
@@ -468,9 +493,9 @@ else
 fi
 
 if "${dry_run}"; then
-    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${rsync_dest}")
+    rsync_output=$(run_rsync_capture rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${rsync_dest}")
 else
-    rsync_output=$(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
+    rsync_output=$(run_rsync_capture rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
 
     # ── Local folder merge: re-add preserved messages ─────────────────────
     if [[ -n "${merge_work_dir}" ]]; then

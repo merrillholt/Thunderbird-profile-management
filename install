@@ -76,14 +76,12 @@ fi
 # ── dependency check ──────────────────────────────────────────────────────────
 
 check_deps() {
-    local -a deps=(python3 rsync restic flock sqlite3 age zip)
+    local -a deps=(python3 rsync restic flock zip)
     local -A dep_users=(
         [python3]="tbblock-rebuild, thunderbird-restore, thunderbird-dedup-local, thunderbird-mbox-merge, tbblock-native-host, tbq-filter-audit"
         [rsync]="thunderbird-backup, thunderbird-restore"
         [restic]="thunderbird-localfolders-backup"
         [flock]="tbblock, tbblock-native-host"
-        [sqlite3]="tbq-filter-audit"
-        [age]="tbq-filter-audit"
         [zip]="bundle"
     )
 
