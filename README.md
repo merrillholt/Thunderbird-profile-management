@@ -94,7 +94,7 @@ thunderbird-backup
 thunderbird-restore --check        # confirm restore is needed first
 # Close Thunderbird first, then:
 thunderbird-restore
-tbblock-rebuild                    # re-disables catch-all on non-review machines
+# tbblock-rebuild runs automatically at the end of thunderbird-restore
 ```
 
 `thunderbird-restore` uses rsync with `--delete`, so the restored profile exactly matches the backup. Any new local folders created on the review system will appear on restored machines. A merge step preserves messages that exist locally but are absent from the backup, so no local messages are lost.
@@ -132,6 +132,7 @@ Output:
 ```
 Backup date:   2026-05-04 14:30:00
 Last restore:  2026-05-03 09:15:00
+NOTE: verify pCloud has finished syncing on this machine before restoring.
 Status:        Restore needed (backup is newer than last restore)
 ```
 
@@ -175,15 +176,9 @@ The `chmod +x` is required because the pCloud filesystem does not preserve execu
    ```bash
    mkdir -p ~/.config/tbblock && touch ~/.config/tbblock/no-review
    ```
-6. Apply filters for this machine's role:
-   ```bash
-   tbblock-rebuild
-   ```
-7. On the review system, install the native messaging host for the review actions extension:
-   ```bash
-   install-native-host
-   ```
-8. On the review system, install the review actions extension permanently:
+6. `thunderbird-restore` runs `tbblock-rebuild` and (for Flatpak) `install-native-host`
+   automatically — no manual run needed.
+7. On the review system, install the review actions extension permanently:
    ```bash
    install-review-actions
    ```
@@ -208,14 +203,14 @@ thunderbird-backup                 # capture current state
 ```bash
 rm -f ~/.config/tbblock/no-review
 thunderbird-restore                # restore current profile
-tbblock-rebuild                    # enables catch-all
+# tbblock-rebuild runs automatically and enables the catch-all
 ```
 
 ### On all other machines
 
 ```bash
 thunderbird-restore
-tbblock-rebuild                    # re-disables catch-all (no-review marker already set)
+# tbblock-rebuild runs automatically and re-disables the catch-all
 ```
 
 ---
