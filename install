@@ -6,9 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="${HOME}/bin"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 
+# Internal helpers called by full path at runtime — not symlinked into ~/bin,
+# but still need +x set on the source file.
+HELPERS=(
+    tbblock-native-host
+    thunderbird-mbox-merge
+)
+
 # User-facing scripts to expose in ~/bin.
-# Helpers invoked internally (tbblock-native-host, thunderbird-mbox-merge)
-# are omitted — they are called by full path via SCRIPT_DIR at runtime.
 SCRIPTS=(
     tbblock
     tbblock-rebuild
@@ -106,6 +111,22 @@ if ! "${uninstall}"; then
     check_deps
 fi
 
+# Ensure all executables (user-facing and internal helpers) have +x set.
+if ! "${uninstall}"; then
+    for script in "${SCRIPTS[@]}" "${HELPERS[@]}"; do
+        src="${SCRIPT_DIR}/${script}"
+        [[ -f "${src}" ]] || continue
+        if [[ ! -x "${src}" ]]; then
+            if "${dry_run}"; then
+                echo "Would chmod +x: ${src}"
+            else
+                chmod +x "${src}"
+                echo "chmod +x:    ${src}"
+            fi
+        fi
+    done
+fi
+
 # Ensure ~/bin exists.
 if [[ ! -d "${BIN_DIR}" ]]; then
     if "${dry_run}"; then
@@ -149,15 +170,6 @@ for script in "${SCRIPTS[@]}"; do
             (( skipped++ )) || true
         fi
         continue
-    fi
-
-    # Ensure source is executable.
-    if [[ ! -x "${src}" ]]; then
-        if "${dry_run}"; then
-            echo "Would chmod +x: ${src}"
-        else
-            chmod +x "${src}"
-        fi
     fi
 
     if [[ -L "${dst}" ]]; then
