@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -A1 -B1 'important\\\\|\\\\$label5')",
+      "Bash(grep -v \"^--$\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(e.get\\('defaultLocale',{}\\).get\\('name','?'\\), e.get\\('id',''\\)\\) for e in d.get\\('addons',[]\\)]\")",
+      "Bash(python3 *)",
+      "Bash(echo \"@test-spam.com\")",
+      "Bash(echo \"@junk-mail.net\")",
+      "Bash(cp ~/.var/app/org.mozilla.Thunderbird/.thunderbird/bqmdw26k.default-default/ImapMail/imap.comcast.net/msgFilterRules.dat /tmp/test_filter.dat)",
+      "Bash(mkdir -p ~/bin)",
+      "Bash(echo \"# Test domains\")",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/tbblock-rebuild --dry-run)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/tbblock --list)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/tbblock-rebuild --help)",
+      "Bash(flatpak override *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Read(//mnt/pcloud/Thunderbird Backup/metadata/**)",
+      "Read(//mnt/pcloud/Thunderbird Backup/profile-root/**)",
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/thunderbird-restore)",
+      "Bash(gh *)",
+      "Bash(git *)",
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/tbblock)",
+      "Bash(flatpak info *)",
+      "Bash(flatpak run *)",
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/install-native-host)",
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/thunderbird-backup)"
+    ]
+  }
+}
