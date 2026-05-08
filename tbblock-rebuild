@@ -5,6 +5,7 @@ Usage:
   tbblock-rebuild             preview changes, prompt, and apply
   tbblock-rebuild --dry-run   preview changes without applying
   tbblock-rebuild --no-review force no-review mode for this run
+  tbblock-rebuild --yes       apply without prompting (non-interactive)
   tbblock-rebuild --list      show current filter and role state
 
 Role (review vs no-review) is determined by the marker file:
@@ -371,7 +372,7 @@ def cmd_list() -> int:
     return 0
 
 
-def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
+def cmd_apply(dry_run: bool = False, no_review: bool | None = None, yes: bool = False) -> int:
     if no_review is None:
         no_review = NO_REVIEW_MARKER.exists()
 
@@ -535,15 +536,15 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
         print("(dry run — no changes applied)")
         return 0
 
-    try:
-        answer = input("Apply these changes? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\nAborted.")
-        return 1
-
-    if answer not in ("y", "yes"):
-        print("Aborted.")
-        return 1
+    if not yes:
+        try:
+            answer = input("Apply these changes? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 1
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 1
 
     catchall_update_set = set(catchall_updates)
     print()
@@ -590,20 +591,20 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None) -> int:
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args:
-        return cmd_apply()
-    if args[0] in ("--list", "-l"):
-        return cmd_list()
-    if args[0] in ("--dry-run", "-n"):
-        return cmd_apply(dry_run=True)
-    if args[0] == "--no-review":
-        return cmd_apply(no_review=True)
-    if args[0] in ("--help", "-h"):
+    if "--help" in args or "-h" in args:
         print(__doc__.strip())
         return 0
-    print(f"Unknown option: {args[0]}", file=sys.stderr)
-    print(__doc__.strip())
-    return 1
+    if "--list" in args or "-l" in args:
+        return cmd_list()
+    dry_run   = "--dry-run" in args or "-n" in args
+    no_review = True if "--no-review" in args else None
+    yes       = "--yes" in args or "-y" in args
+    unknown   = [a for a in args if a not in ("--dry-run", "-n", "--no-review", "--yes", "-y")]
+    if unknown:
+        print(f"Unknown option: {unknown[0]}", file=sys.stderr)
+        print(__doc__.strip())
+        return 1
+    return cmd_apply(dry_run=dry_run, no_review=no_review, yes=yes)
 
 
 if __name__ == "__main__":

@@ -446,4 +446,6 @@ EOF
 echo "${report}"
 if ! "${dry_run}"; then
     echo "${report}" >> "${log_file}"
+    echo "NOTE: pCloud must finish syncing before this backup is valid for restore"
+    echo "      on another machine. Wait for pCloud to show idle before restoring."
 fi

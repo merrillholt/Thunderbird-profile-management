@@ -149,6 +149,7 @@ if "${check}"; then
 
     printf 'Backup date:   %s\n' "${manifest_date:-(unknown)}"
     printf 'Last restore:  %s\n' "${last_restore:-(never)}"
+    echo "NOTE: verify pCloud has finished syncing on this machine before restoring."
 
     if [[ -z "${manifest_date}" ]]; then
         echo "Status:        Unknown (backup manifest not found)"
@@ -378,10 +379,23 @@ if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
     fi
 fi
 
+# Peek at backup and last-restore dates for display before confirmation.
+_peek_backup_date=""
+if [[ -f "${src}/.backup_manifest" ]]; then
+    _peek_backup_date=$(awk -F= '/^date=/{print $2}' "${src}/.backup_manifest")
+fi
+_peek_last_restore=""
+if [[ -f "${LAST_RESTORE_FILE}" ]]; then
+    _peek_last_restore=$(cat "${LAST_RESTORE_FILE}")
+fi
+
 # Show restore plan and confirm
 echo "Thunderbird: ${tb_type}"
 echo "Version: ${tb_version}"
 echo "Active profile: ${active_profile}"
+echo "Backup date:    ${_peek_backup_date:-(unknown)}"
+echo "Last restore:   ${_peek_last_restore:-(never)}"
+echo "NOTE: pCloud sync must be complete on this machine before restoring."
 if "${dry_run}"; then
     echo "Dry run: ${src} -> ${dest}"
 else
@@ -463,6 +477,13 @@ resolved_tb_dir=$(readlink -f "${tb_dir}")
 if [[ "${resolved_dest}" != "${resolved_tb_dir}"/* ]]; then
     echo "Error: Refusing to restore outside Thunderbird profile directory: ${dest}" >&2
     exit 1
+fi
+
+# ── Install native messaging host (Flatpak only) ──────────────────────────────
+if ! "${dry_run}" && ! "${self_test}" && [[ "${tb_type}" == "Flatpak" ]]; then
+    echo "Installing native messaging host..."
+    "${SCRIPT_DIR}/install-native-host" 2>&1 || true
+    echo
 fi
 
 # ── Local folder merge: snapshot pre-restore messages ─────────────────────
@@ -632,17 +653,10 @@ post_restore_notes=""
 if ! "${dry_run}" && ! "${self_test}"; then
     post_restore_notes=$(cat <<'NOTES'
 
-  Next steps:
-  1. Run: tbblock-rebuild
-     (applies pending filter changes and sets review/no-review role
-     for this machine based on ~/.config/tbblock/no-review)
-  2. Start Thunderbird and verify all accounts connect.
-  3. Re-enter account passwords if prompted (system keyring is not
+  Next steps (manual):
+  1. Start Thunderbird and verify all accounts connect.
+  2. Re-enter account passwords if prompted (system keyring is not
      included in the profile backup).
-  4. If Thunderbird is Flatpak, verify sandbox permissions:
-       flatpak override --user --show org.mozilla.Thunderbird
-  5. If native messaging hosts were not restored (e.g. first install),
-     run: install-native-host
 NOTES
 )
 fi
@@ -678,6 +692,22 @@ echo "${report}"
 echo "${report}" >> "${log_file}"
 if [[ -n "${post_restore_notes}" ]]; then
     echo "${post_restore_notes}"
+fi
+
+if ! "${dry_run}" && ! "${self_test}"; then
+    echo
+    echo "=============================="
+    echo "  Post-restore automation"
+    echo "=============================="
+    echo
+    echo "--- tbblock-rebuild ---"
+    "${SCRIPT_DIR}/tbblock-rebuild" --yes || true
+    echo
+    if [[ "${tb_type}" == "Flatpak" ]]; then
+        echo "--- Flatpak sandbox permissions ---"
+        flatpak override --user --show org.mozilla.Thunderbird 2>/dev/null || true
+    fi
+    echo "=============================="
 fi
 
 exit 0
