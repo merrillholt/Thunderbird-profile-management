@@ -153,10 +153,10 @@ The repo syncs to all machines automatically via pCloud, but `~/bin` symlinks an
 - Systemd unit files are changed (timers need reloading)
 
 ```bash
-./install
+chmod +x install && ./install
 ```
 
-The script is idempotent — it skips symlinks that are already correct and only updates what has changed.
+The `chmod +x` is required because the pCloud filesystem does not preserve execute bits across syncs. Running `install` then restores execute bits on all scripts. The script is idempotent — it skips symlinks that are already correct and only updates what has changed.
 
 ---
 
@@ -167,8 +167,10 @@ The script is idempotent — it skips symlinks that are already correct and only
 3. Run `thunderbird-restore` to load the current profile.
 4. Run the install script to create `~/bin` symlinks and enable backup timers:
    ```bash
-   ./install
+   chmod +x install && ./install
    ```
+   The `chmod +x` is needed because the pCloud filesystem does not preserve
+   execute bits across syncs.
 5. Mark the machine as non-review (skip if this will be the review system):
    ```bash
    mkdir -p ~/.config/tbblock && touch ~/.config/tbblock/no-review
