@@ -54,21 +54,22 @@ format_activity_table() {
         printf '  (no activity recorded yet)\n'
         return
     fi
-    printf '  %-20s  %-22s  %-22s\n' "Computer" "Last Backup" "Last Restore"
-    printf '  %-20s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------"
+    printf '  %-20s  %-22s  %-22s  %-22s\n' "Computer" "Last Backup" "Last LF Backup" "Last Restore"
+    printf '  %-20s  %-22s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------" "----------------------"
     awk -F'\t' '
         NF == 3 {
             host=$2; action=$3; date=$1
-            if (action=="backup"  && (!(host in b) || date>b[host])) b[host]=date
-            if (action=="restore" && (!(host in r) || date>r[host])) r[host]=date
+            if (action=="backup"             && (!(host in b)  || date>b[host]))  b[host]=date
+            if (action=="localfolders-backup" && (!(host in lf) || date>lf[host])) lf[host]=date
+            if (action=="restore"            && (!(host in r)  || date>r[host]))  r[host]=date
             seen[host]=1
         }
         END {
             for (host in seen)
-                printf "%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in r ? r[host] : "-")
+                printf "%s\t%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in lf ? lf[host] : "-"), (host in r ? r[host] : "-")
         }
-    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate rdate; do
-        printf '  %-20s  %-22s  %-22s\n' "${host}" "${bdate}" "${rdate}"
+    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate; do
+        printf '  %-20s  %-22s  %-22s  %-22s\n' "${host}" "${bdate}" "${lfdate}" "${rdate}"
     done
 }
 
@@ -483,7 +484,7 @@ if ! "${dry_run}"; then
     echo "${report}" >> "${log_file}"
     if [[ -n "${pcloud_backup_root}" ]]; then
         echo "Syncing local backup to pCloud..."
-        run_rsync_capture rsync -a --delete "${local_staging}/" "${pcloud_backup_root}/"
+        run_rsync_capture rsync -r --times --delete --no-perms --no-owner --no-group --no-devices --no-specials "${local_staging}/" "${pcloud_backup_root}/"
         echo "pCloud sync complete."
         if ! "${self_test}"; then
             log_activity "backup" "${pcloud_backup_root}/activity.log"

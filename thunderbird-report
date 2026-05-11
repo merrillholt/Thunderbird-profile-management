@@ -47,21 +47,22 @@ format_activity_table() {
         printf '  (no activity recorded yet)\n'
         return
     fi
-    printf '  %-20s  %-22s  %-22s\n' "Computer" "Last Backup" "Last Restore"
-    printf '  %-20s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------"
+    printf '  %-20s  %-22s  %-22s  %-22s\n' "Computer" "Last Backup" "Last LF Backup" "Last Restore"
+    printf '  %-20s  %-22s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------" "----------------------"
     awk -F'\t' '
         NF == 3 {
             host=$2; action=$3; date=$1
-            if (action=="backup"  && (!(host in b) || date>b[host])) b[host]=date
-            if (action=="restore" && (!(host in r) || date>r[host])) r[host]=date
+            if (action=="backup"             && (!(host in b)  || date>b[host]))  b[host]=date
+            if (action=="localfolders-backup" && (!(host in lf) || date>lf[host])) lf[host]=date
+            if (action=="restore"            && (!(host in r)  || date>r[host]))  r[host]=date
             seen[host]=1
         }
         END {
             for (host in seen)
-                printf "%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in r ? r[host] : "-")
+                printf "%s\t%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in lf ? lf[host] : "-"), (host in r ? r[host] : "-")
         }
-    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate rdate; do
-        printf '  %-20s  %-22s  %-22s\n' "${host}" "${bdate}" "${rdate}"
+    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate; do
+        printf '  %-20s  %-22s  %-22s  %-22s\n' "${host}" "${bdate}" "${lfdate}" "${rdate}"
     done
 }
 
@@ -144,11 +145,24 @@ fi
 last_restore=""
 [[ -f "${LAST_RESTORE_FILE}" ]] && last_restore=$(cat "${LAST_RESTORE_FILE}")
 
+# ── This machine's last backup (from activity log) ────────────────────────────
+this_host_last_backup=""
+if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/activity.log" ]]; then
+    this_host_last_backup=$(awk -F'\t' -v host="$(hostname -s)" '
+        NF == 3 && $2 == host && $3 == "backup" {
+            if ($1 > last) last = $1
+        }
+        END { if (last != "") print last }
+    ' "${pcloud_backup_root}/activity.log")
+fi
+
 # ── Restore status ────────────────────────────────────────────────────────────
 if [[ -z "${pcloud_backup_root}" ]]; then
     restore_status="Unknown (pCloud not mounted)"
 elif [[ -z "${manifest_date}" ]]; then
     restore_status="Unknown (no backup manifest)"
+elif [[ -n "${this_host_last_backup}" && ! "${this_host_last_backup}" < "${manifest_date}" ]]; then
+    restore_status="Up to date (this machine created the current backup)"
 elif [[ -z "${last_restore}" ]]; then
     restore_status="Restore needed (never restored on this machine)"
 elif [[ "${last_restore}" < "${manifest_date}" ]]; then
