@@ -43,6 +43,35 @@ run_rsync_capture() {
     printf '%s\n' "${output}"
 }
 
+log_activity() {
+    local action="$1" log_path="$2"
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "${action}" >> "${log_path}"
+}
+
+format_activity_table() {
+    local log_path="$1"
+    if [[ ! -f "${log_path}" ]]; then
+        printf '  (no activity recorded yet)\n'
+        return
+    fi
+    printf '  %-20s  %-22s  %-22s\n' "Computer" "Last Backup" "Last Restore"
+    printf '  %-20s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------"
+    awk -F'\t' '
+        NF == 3 {
+            host=$2; action=$3; date=$1
+            if (action=="backup"  && (!(host in b) || date>b[host])) b[host]=date
+            if (action=="restore" && (!(host in r) || date>r[host])) r[host]=date
+            seen[host]=1
+        }
+        END {
+            for (host in seen)
+                printf "%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in r ? r[host] : "-")
+        }
+    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate rdate; do
+        printf '  %-20s  %-22s  %-22s\n' "${host}" "${bdate}" "${rdate}"
+    done
+}
+
 for arg in "$@"; do
     case "${arg}" in
         --dry-run) dry_run=true ;;
@@ -83,6 +112,9 @@ EOF
     echo 'user_pref("mail.server.server1.hostname", "example.com");' > "${tb_dir}/test.profile/prefs.js"
 }
 
+pcloud_backup_root=""
+local_staging=""
+
 if "${self_test}"; then
     setup_self_test
 else
@@ -91,14 +123,16 @@ else
             echo "Error: ${pcloud_mount} is not writable." >&2
             exit 1
         fi
-        backup_root="${pcloud_mount}/${backup_root_rel}"
+        pcloud_backup_root="${pcloud_mount}/${backup_root_rel}"
     elif [[ -d "${pcloud_drive}" ]]; then
-        backup_root="${pcloud_drive}/${backup_root_rel}"
+        pcloud_backup_root="${pcloud_drive}/${backup_root_rel}"
     else
         echo "Error: No pCloud mount or drive found (${pcloud_mount} or ${pcloud_drive})." >&2
         exit 1
     fi
 
+    local_staging="${HOME}/.local/share/thunderbird-backup"
+    backup_root="${local_staging}"
     dest="${backup_root}/thunderbird/"
     log_file="${backup_root}/backup.log"
 fi
@@ -430,7 +464,8 @@ report=$(cat <<EOF
   Version:            ${tb_version}
   Profile:            ${active_profile}
   Source:             ${src}
-  Destination:        ${dest}
+  Local backup:       ${dest}
+  pCloud backup:      ${pcloud_backup_root:+${pcloud_backup_root}/thunderbird/}
   Duration:           ${duration}
   Files transferred:  ${files_transferred}
   Data transferred:   ${sent}
@@ -446,6 +481,17 @@ EOF
 echo "${report}"
 if ! "${dry_run}"; then
     echo "${report}" >> "${log_file}"
+    if [[ -n "${pcloud_backup_root}" ]]; then
+        echo "Syncing local backup to pCloud..."
+        run_rsync_capture rsync -a --delete "${local_staging}/" "${pcloud_backup_root}/"
+        echo "pCloud sync complete."
+        if ! "${self_test}"; then
+            log_activity "backup" "${pcloud_backup_root}/activity.log"
+            echo
+            echo "  Computer Activity"
+            format_activity_table "${pcloud_backup_root}/activity.log"
+        fi
+    fi
     echo "NOTE: pCloud must finish syncing before this backup is valid for restore"
     echo "      on another machine. Wait for pCloud to show idle before restoring."
 fi

@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pcloud_mount="/mnt/pcloud"
+pcloud_drive="${HOME}/pCloudDrive"
+backup_root_rel="Thunderbird Backup"
+local_staging="${HOME}/.local/share/thunderbird-backup"
+LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
+NO_REVIEW_FILE="${HOME}/.config/tbblock/no-review"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0")
+
+Show backup, restore, role, and cross-machine activity status for Thunderbird Tools.
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "Error: Unknown option: ${arg}" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+run_quick_check() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5s "$@" >/dev/null 2>&1
+    else
+        "$@" >/dev/null 2>&1
+    fi
+}
+
+check_thunderbird_running() {
+    pgrep -x thunderbird &>/dev/null || \
+    pgrep -x thunderbird-bin &>/dev/null || \
+    { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
+}
+
+format_activity_table() {
+    local log_path="$1"
+    if [[ ! -f "${log_path}" ]]; then
+        printf '  (no activity recorded yet)\n'
+        return
+    fi
+    printf '  %-20s  %-22s  %-22s\n' "Computer" "Last Backup" "Last Restore"
+    printf '  %-20s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------"
+    awk -F'\t' '
+        NF == 3 {
+            host=$2; action=$3; date=$1
+            if (action=="backup"  && (!(host in b) || date>b[host])) b[host]=date
+            if (action=="restore" && (!(host in r) || date>r[host])) r[host]=date
+            seen[host]=1
+        }
+        END {
+            for (host in seen)
+                printf "%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in r ? r[host] : "-")
+        }
+    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate rdate; do
+        printf '  %-20s  %-22s  %-22s\n' "${host}" "${bdate}" "${rdate}"
+    done
+}
+
+# ── pCloud ────────────────────────────────────────────────────────────────────
+if [[ -d "${pcloud_mount}" ]]; then
+    pcloud_backup_root="${pcloud_mount}/${backup_root_rel}"
+    pcloud_label="mounted (${pcloud_mount})"
+elif [[ -d "${pcloud_drive}" ]]; then
+    pcloud_backup_root="${pcloud_drive}/${backup_root_rel}"
+    pcloud_label="mounted (${pcloud_drive})"
+else
+    pcloud_backup_root=""
+    pcloud_label="not mounted"
+fi
+
+# ── Thunderbird ───────────────────────────────────────────────────────────────
+if command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird; then
+    tb_type="Flatpak"
+    tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+elif command -v snap &>/dev/null && run_quick_check snap list thunderbird; then
+    tb_type="Snap"
+    tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
+elif command -v thunderbird &>/dev/null; then
+    tb_type="System"
+    tb_dir="${HOME}/.thunderbird"
+else
+    tb_type="not found"
+    tb_dir=""
+fi
+
+tb_version="unknown"
+if [[ "${tb_type}" == "Flatpak" ]]; then
+    tb_version=$(timeout 5s flatpak info org.mozilla.Thunderbird 2>/dev/null \
+        | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
+elif [[ "${tb_type}" != "not found" ]] && command -v thunderbird &>/dev/null; then
+    tb_version=$(thunderbird --version 2>/dev/null | awk '{print $2}' || true)
+fi
+[[ -n "${tb_version}" ]] || tb_version="unknown"
+
+if check_thunderbird_running; then
+    tb_running="yes"
+else
+    tb_running="no"
+fi
+
+# ── Role ──────────────────────────────────────────────────────────────────────
+if [[ -f "${NO_REVIEW_FILE}" ]]; then
+    tb_role="non-review"
+else
+    tb_role="review"
+fi
+
+# ── Backup manifest ───────────────────────────────────────────────────────────
+manifest_date=""
+manifest_profile=""
+manifest_files=""
+manifest_profile_size=""
+if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/thunderbird/.backup_manifest" ]]; then
+    mf="${pcloud_backup_root}/thunderbird/.backup_manifest"
+    manifest_date=$(awk -F= '/^date=/{print $2}' "${mf}")
+    manifest_profile=$(awk -F= '/^profile=/{print $2}' "${mf}")
+    manifest_files=$(awk -F= '/^file_count=/{print $2}' "${mf}")
+    manifest_profile_size=$(awk -F= '/^profile_size=/{print $2}' "${mf}")
+fi
+
+# ── Sizes ─────────────────────────────────────────────────────────────────────
+pcloud_backup_size=""
+if [[ -n "${pcloud_backup_root}" && -d "${pcloud_backup_root}" ]]; then
+    pcloud_backup_size=$(du -sh "${pcloud_backup_root}" 2>/dev/null | cut -f1 || true)
+fi
+
+if [[ -d "${local_staging}" ]]; then
+    local_staging_size=$(du -sh "${local_staging}" 2>/dev/null | cut -f1 || true)
+    local_staging_label="present (${local_staging_size})"
+else
+    local_staging_label="absent"
+fi
+
+# ── Last restore ──────────────────────────────────────────────────────────────
+last_restore=""
+[[ -f "${LAST_RESTORE_FILE}" ]] && last_restore=$(cat "${LAST_RESTORE_FILE}")
+
+# ── Restore status ────────────────────────────────────────────────────────────
+if [[ -z "${pcloud_backup_root}" ]]; then
+    restore_status="Unknown (pCloud not mounted)"
+elif [[ -z "${manifest_date}" ]]; then
+    restore_status="Unknown (no backup manifest)"
+elif [[ -z "${last_restore}" ]]; then
+    restore_status="Restore needed (never restored on this machine)"
+elif [[ "${last_restore}" < "${manifest_date}" ]]; then
+    restore_status="Restore needed (backup is newer than last restore)"
+else
+    restore_status="Up to date"
+fi
+
+# ── Report ────────────────────────────────────────────────────────────────────
+cat <<EOF
+==============================
+  Thunderbird Status Report
+==============================
+  Date:               $(date '+%Y-%m-%d %H:%M:%S')
+  Machine:            $(hostname -s)
+  Thunderbird:        ${tb_type} ${tb_version}
+  Running:            ${tb_running}
+  Role:               ${tb_role}
+
+  --- Backup ---
+  pCloud:             ${pcloud_label}
+  Last backup:        ${manifest_date:-(none)}
+  Profile:            ${manifest_profile:-(unknown)}
+  Files:              ${manifest_files:-(unknown)}
+  Profile size:       ${manifest_profile_size:-(unknown)}
+  pCloud backup size: ${pcloud_backup_size:-(unavailable)}
+  Local staging:      ${local_staging_label}
+
+  --- This Machine ---
+  Last restore:       ${last_restore:-(never)}
+  Status:             ${restore_status}
+
+  --- Computer Activity ---
+EOF
+
+if [[ -n "${pcloud_backup_root}" ]]; then
+    format_activity_table "${pcloud_backup_root}/activity.log"
+else
+    printf '  (pCloud not mounted)\n'
+fi
+
+echo "=============================="

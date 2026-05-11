@@ -42,6 +42,35 @@ run_rsync_capture() {
     printf '%s\n' "${output}"
 }
 
+log_activity() {
+    local action="$1" log_path="$2"
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "${action}" >> "${log_path}"
+}
+
+format_activity_table() {
+    local log_path="$1"
+    if [[ ! -f "${log_path}" ]]; then
+        printf '  (no activity recorded yet)\n'
+        return
+    fi
+    printf '  %-20s  %-22s  %-22s\n' "Computer" "Last Backup" "Last Restore"
+    printf '  %-20s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------"
+    awk -F'\t' '
+        NF == 3 {
+            host=$2; action=$3; date=$1
+            if (action=="backup"  && (!(host in b) || date>b[host])) b[host]=date
+            if (action=="restore" && (!(host in r) || date>r[host])) r[host]=date
+            seen[host]=1
+        }
+        END {
+            for (host in seen)
+                printf "%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in r ? r[host] : "-")
+        }
+    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate rdate; do
+        printf '  %-20s  %-22s  %-22s\n' "${host}" "${bdate}" "${rdate}"
+    done
+}
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test] [--check]
@@ -539,6 +568,9 @@ else
         mkdir -p "$(dirname "${LAST_RESTORE_FILE}")"
         printf '%s\n' "${manifest_date}" > "${LAST_RESTORE_FILE}"
     fi
+    if ! "${self_test}"; then
+        log_activity "restore" "${backup_root}/activity.log"
+    fi
 fi
 [[ -n "${tmp_dry_dest}" ]] && rm -rf "${tmp_dry_dest}"
 end_time=$(date +%s)
@@ -690,6 +722,11 @@ EOF
 
 echo "${report}"
 echo "${report}" >> "${log_file}"
+if ! "${dry_run}" && ! "${self_test}"; then
+    echo
+    echo "  Computer Activity"
+    format_activity_table "${backup_root}/activity.log"
+fi
 if [[ -n "${post_restore_notes}" ]]; then
     echo "${post_restore_notes}"
 fi

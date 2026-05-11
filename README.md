@@ -268,13 +268,16 @@ restic -r ~/pcloud/"Thunderbird Backup"/localfolders-restic restore <snapshot-id
 ## Audit and diagnostics
 
 ```bash
-thunderbird-restore --check        # check if backup is newer than last restore
+thunderbird-report                 # full status: backup, restore, role, and computer activity
+thunderbird-restore --check        # quick check: is this machine's restore up to date?
 thunderbird-audit                  # inspect profiles, detect orphans
 thunderbird-audit --fix            # interactive cleanup (use with care)
 tbblock-rebuild --list             # show role, catch-all state, blocked domains, routes
 tbq-filter-audit --account bluerug --search paypal --why
 tbq-filter-audit --search reverb --limit 5
 ```
+
+Each successful backup and restore appends a record to `Thunderbird Backup/activity.log` on pCloud. The backup and restore reports include a **Computer Activity** table showing the most recent backup and restore date for every machine that has used these tools.
 
 ---
 
@@ -288,3 +291,6 @@ The backup is stored under `Thunderbird Backup/` on pCloud:
 | `profile-root/` | `profiles.ini` and `installs.ini` |
 | `metadata/` | Flatpak overrides, portal grants, MIME handler defaults |
 | `localfolders-restic/` | Restic repository for historical Local Folders snapshots |
+| `activity.log` | Tab-separated record of backup and restore events by machine |
+
+`thunderbird-backup` writes first to a local staging directory (`~/.local/share/thunderbird-backup/`), then pushes the completed snapshot to pCloud with a single rsync pass. This prevents pCloud from racing to upload partially-written files. The local copy is immediately available for restore without waiting for pCloud sync.

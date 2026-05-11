@@ -21,6 +21,7 @@ SCRIPTS=(
     thunderbird-audit
     thunderbird-backup
     thunderbird-restore
+    thunderbird-report
     thunderbird-localfolders-backup
     thunderbird-dedup-local
     install-native-host
