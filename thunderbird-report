@@ -4,6 +4,8 @@ set -euo pipefail
 pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
+default_repo_subdir="localfolders-restic"
+default_profile_repo_subdir="profile-restic"
 local_staging="${HOME}/.local/share/thunderbird-backup"
 LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
 NO_REVIEW_FILE="${HOME}/.config/tbblock/no-review"
@@ -55,10 +57,19 @@ check_thunderbird_running() {
 
 format_activity_table() {
     local log_path="$1"
-    if [[ ! -f "${log_path}" ]]; then
+    shift || true
+    local sources=()
+    [[ -f "${log_path}" ]] && sources+=("${log_path}")
+    local extra
+    for extra in "$@"; do
+        [[ -f "${extra}" ]] && sources+=("${extra}")
+    done
+
+    if [[ ${#sources[@]} -eq 0 ]]; then
         printf '  (no activity recorded yet)\n'
         return
     fi
+
     printf '  %-20s  %-22s  %-22s  %-22s\n' "Computer" "Last Backup" "Last LF Backup" "Last Restore"
     printf '  %-20s  %-22s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------" "----------------------"
     awk -F'\t' '
@@ -73,9 +84,90 @@ format_activity_table() {
             for (host in seen)
                 printf "%s\t%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in lf ? lf[host] : "-"), (host in r ? r[host] : "-")
         }
-    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate; do
+    ' "${sources[@]}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate; do
         printf '  %-20s  %-22s  %-22s  %-22s\n' "${host}" "${bdate}" "${lfdate}" "${rdate}"
     done
+}
+
+query_lf_snapshots_json() {
+    local repo="$1"
+    local pw_file="$2"
+
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        RESTIC_REPOSITORY="${repo}" restic snapshots --tag local-folders --json 2>/dev/null
+    elif [[ -f "${pw_file}" ]]; then
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${pw_file}" restic snapshots --tag local-folders --json 2>/dev/null
+    else
+        RESTIC_REPOSITORY="${repo}" restic snapshots --tag local-folders --json 2>/dev/null
+    fi
+}
+
+query_profile_snapshots_json() {
+    local repo="$1"
+    local pw_file="$2"
+
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        RESTIC_REPOSITORY="${repo}" restic snapshots --tag thunderbird-profile --json 2>/dev/null
+    elif [[ -f "${pw_file}" ]]; then
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${pw_file}" restic snapshots --tag thunderbird-profile --json 2>/dev/null
+    else
+        RESTIC_REPOSITORY="${repo}" restic snapshots --tag thunderbird-profile --json 2>/dev/null
+    fi
+}
+
+latest_snapshot_time() {
+    python3 -c '
+import json
+import sys
+from datetime import datetime
+
+try:
+    snapshots = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+latest = ""
+for snapshot in snapshots:
+    timestamp = snapshot.get("time") or ""
+    if not timestamp:
+        continue
+    timestamp = timestamp.replace("Z", "+00:00")
+    try:
+        rendered = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        rendered = timestamp[:19].replace("T", " ")
+    if rendered > latest:
+        latest = rendered
+
+if latest:
+    print(latest)
+'
+}
+
+format_lf_snapshots_as_activity() {
+    python3 -c '
+import json
+import sys
+from datetime import datetime
+
+try:
+    snapshots = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+for snapshot in snapshots:
+    host = snapshot.get("hostname") or snapshot.get("host") or "unknown"
+    timestamp = snapshot.get("time") or ""
+    if not timestamp:
+        continue
+    timestamp = timestamp.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(timestamp)
+        timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        timestamp = timestamp[:19].replace("T", " ")
+    print(f"{timestamp}\t{host}\tlocalfolders-backup")
+'
 }
 
 # ── pCloud ────────────────────────────────────────────────────────────────────
@@ -157,6 +249,30 @@ fi
 last_restore=""
 [[ -f "${LAST_RESTORE_FILE}" ]] && last_restore=$(cat "${LAST_RESTORE_FILE}")
 
+# ── Profile snapshot status ──────────────────────────────────────────────────
+profile_snapshot_label="not configured"
+profile_repo="${pcloud_backup_root:+${pcloud_backup_root}/${default_profile_repo_subdir}}"
+profile_pw_file="${pcloud_backup_root:+${pcloud_backup_root}/.restic-password}"
+if [[ -n "${profile_repo}" ]]; then
+    if [[ ! -f "${profile_repo}/config" ]]; then
+        profile_snapshot_label="repo missing"
+    elif ! command -v restic >/dev/null 2>&1; then
+        profile_snapshot_label="restic not installed"
+    elif [[ -z "${RESTIC_PASSWORD:-}" && -z "${RESTIC_PASSWORD_FILE:-}" && ! -f "${profile_pw_file}" ]]; then
+        profile_snapshot_label="password unavailable"
+    else
+        if profile_snapshot_latest=$(query_profile_snapshots_json "${profile_repo}" "${profile_pw_file}" | latest_snapshot_time); then
+            if [[ -n "${profile_snapshot_latest}" ]]; then
+                profile_snapshot_label="${profile_snapshot_latest} (restic)"
+            else
+                profile_snapshot_label="no snapshots"
+            fi
+        else
+            profile_snapshot_label="snapshots unavailable"
+        fi
+    fi
+fi
+
 # ── This machine's last backup (from activity log) ────────────────────────────
 this_host_last_backup=""
 if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/activity.log" ]]; then
@@ -166,6 +282,63 @@ if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/activity.log" ]]; 
         }
         END { if (last != "") print last }
     ' "${pcloud_backup_root}/activity.log")
+fi
+
+# ── Local Folders backup status ───────────────────────────────────────────────
+lf_snapshot_activity=""
+lf_backup_label="(none)"
+lf_repo_status=""
+lf_repo="${pcloud_backup_root:+${pcloud_backup_root}/${default_repo_subdir}}"
+lf_pw_file="${pcloud_backup_root:+${pcloud_backup_root}/.restic-password}"
+
+if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/activity.log" ]]; then
+    lf_activity_latest=$(awk -F'\t' '
+        NF == 3 && $3 == "localfolders-backup" {
+            if ($1 > last) last = $1
+        }
+        END { if (last != "") print last }
+    ' "${pcloud_backup_root}/activity.log")
+else
+    lf_activity_latest=""
+fi
+
+if [[ -n "${lf_repo}" ]]; then
+    if [[ ! -f "${lf_repo}/config" ]]; then
+        lf_repo_status="repo missing"
+    elif ! command -v restic >/dev/null 2>&1; then
+        lf_repo_status="restic not installed"
+    elif [[ -z "${RESTIC_PASSWORD:-}" && -z "${RESTIC_PASSWORD_FILE:-}" && ! -f "${lf_pw_file}" ]]; then
+        lf_repo_status="password unavailable"
+    else
+        lf_snapshot_activity=$(mktemp)
+        trap '[[ -n "${lf_snapshot_activity}" ]] && rm -f "${lf_snapshot_activity}"' EXIT
+        if query_lf_snapshots_json "${lf_repo}" "${lf_pw_file}" | format_lf_snapshots_as_activity > "${lf_snapshot_activity}"; then
+            if [[ -s "${lf_snapshot_activity}" ]]; then
+                lf_snapshot_latest=$(awk -F'\t' '{ if ($1 > last) last = $1 } END { if (last != "") print last }' "${lf_snapshot_activity}")
+            else
+                lf_snapshot_latest=""
+                lf_repo_status="no snapshots"
+            fi
+        else
+            : > "${lf_snapshot_activity}"
+            lf_snapshot_latest=""
+            lf_repo_status="snapshots unavailable"
+        fi
+    fi
+fi
+
+if [[ -n "${lf_activity_latest}" && -n "${lf_snapshot_latest:-}" ]]; then
+    if [[ "${lf_activity_latest}" > "${lf_snapshot_latest}" ]]; then
+        lf_backup_label="${lf_activity_latest} (activity log)"
+    else
+        lf_backup_label="${lf_snapshot_latest} (restic)"
+    fi
+elif [[ -n "${lf_activity_latest}" ]]; then
+    lf_backup_label="${lf_activity_latest} (activity log)"
+elif [[ -n "${lf_snapshot_latest:-}" ]]; then
+    lf_backup_label="${lf_snapshot_latest} (restic)"
+elif [[ -n "${lf_repo_status}" ]]; then
+    lf_backup_label="${lf_repo_status}"
 fi
 
 # ── Restore status ────────────────────────────────────────────────────────────
@@ -195,11 +368,13 @@ cat <<EOF
   Role:               ${tb_role}
 
   --- Backup ---
-  pCloud:             ${pcloud_label}
-  Last backup:        ${manifest_date:-(none)}
+  Storage:            pCloud sync (${pcloud_label})
+  Profile snapshot:   ${profile_snapshot_label}
+  Current mirror:     ${manifest_date:-(none)}
   Profile:            ${manifest_profile:-(unknown)}
   Files:              ${manifest_files:-(unknown)}
   Profile size:       ${manifest_profile_size:-(unknown)}
+  Last LF backup:     ${lf_backup_label}
   pCloud backup size: ${pcloud_backup_size:-(unavailable)}
   Local staging:      ${local_staging_label}
 
@@ -211,7 +386,7 @@ cat <<EOF
 EOF
 
 if [[ -n "${pcloud_backup_root}" ]]; then
-    format_activity_table "${pcloud_backup_root}/activity.log"
+    format_activity_table "${pcloud_backup_root}/activity.log" "${lf_snapshot_activity}"
 else
     printf '  (pCloud not mounted)\n'
 fi

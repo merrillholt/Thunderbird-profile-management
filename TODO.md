@@ -8,6 +8,22 @@
 - [x] Make `thunderbird-backup` manifest file count match the profile mirror, or label it as backup-root count.
 - [x] Update stale Flatpak development override path in review-actions documentation.
 
+## Backup Resilience
+
+- [x] Separate ownership of pCloud backup subdirectories so no script deletes another tool's data.
+- [x] Replace root-level backup mirroring with targeted syncs and safety markers.
+- [x] Make `thunderbird-backup` run Local Folders backup only on non-review machines by default.
+- [ ] Move full Thunderbird profile backups to versioned snapshots, preferably restic.
+  - [x] Add profile restic repository init, snapshot creation, and snapshot listing support.
+- [x] Treat pCloud as sync/storage transport, not the backup source of truth.
+- [x] Make reports derive Local Folders history from restic snapshots, with activity logs as secondary context.
+- [x] Add preflight checks before any destructive sync.
+- [x] Add integrity checks for profile and Local Folders backups.
+- [x] Add a `doctor` command for backup health, timers, passwords, repos, and restore readiness.
+- [x] Add snapshot-based restore listing and restore selection.
+  - [x] Add `thunderbird-restore --list` for the current latest profile mirror.
+  - [x] Add `thunderbird-restore --snapshot ID` profile restic restore selection.
+
 ## Completed
 
 - [x] Fix `thunderbird-restore --dry-run` / empty-note runs returning failure after reporting success.

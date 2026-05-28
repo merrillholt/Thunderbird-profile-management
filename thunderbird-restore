@@ -10,13 +10,16 @@ self_test=false
 self_test_root=""
 no_merge=false
 check=false
+list=false
+snapshot_id=""
 merge_work_dir=""
+snapshot_restore_dir=""
 merge_status="Skipped"
 manifest_date=""
 
 LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
 
-trap '[[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"' EXIT
+trap '[[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"; [[ -n "${snapshot_restore_dir:-}" ]] && rm -rf "${snapshot_restore_dir}"' EXIT
 
 run_rsync_capture() {
     local output status
@@ -85,7 +88,7 @@ get_this_host_last_backup() {
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test] [--check]
+Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test] [--check] [--list] [--snapshot ID]
 
 Options:
   --dry-run    Show what would be restored without making changes
@@ -93,28 +96,61 @@ Options:
   --self-test  Run a safe self-test using temporary data
   --check      Check if a restore is needed without restoring
                Exit 0 = up to date, 1 = restore needed, 2 = unknown
+  --list       List available profile restore sources without restoring
+  --snapshot ID
+               Restore from a profile restic snapshot instead of the latest mirror
   -h, --help   Show this help
 EOF
 }
 
-for arg in "$@"; do
-    case "${arg}" in
+i=0
+args=("$@")
+while (( i < ${#args[@]} )); do
+    case "${args[$i]}" in
         --dry-run) dry_run=true ;;
         --no-merge) no_merge=true ;;
         --self-test) self_test=true ;;
         --check) check=true ;;
+        --list) list=true ;;
+        --snapshot)
+            (( i++ )) || true
+            snapshot_id="${args[$i]:-}"
+            if [[ -z "${snapshot_id}" ]]; then
+                echo "Error: --snapshot requires a snapshot ID." >&2
+                exit 1
+            fi
+            ;;
+        --snapshot=*) snapshot_id="${args[$i]#--snapshot=}" ;;
         -h|--help) usage; exit 0 ;;
         *)
-            echo "Error: Unknown option: ${arg}" >&2
+            echo "Error: Unknown option: ${args[$i]}" >&2
             usage >&2
             exit 1
             ;;
     esac
+    (( i++ )) || true
 done
 
 pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
+default_profile_repo_subdir="profile-restic"
+
+have_restic_password() {
+    [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" || -f "${restic_password_file:-}" ]]
+}
+
+run_profile_restic() {
+    local repo="$1"
+    shift
+
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        RESTIC_REPOSITORY="${repo}" restic "$@"
+    else
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic "$@"
+    fi
+}
+default_profile_repo_subdir="profile-restic"
 
 setup_self_test() {
     local root
@@ -176,6 +212,121 @@ fi
 backup_root="$(dirname "${src%/}")"
 profile_root_src="${backup_root}/profile-root"
 metadata_src="${backup_root}/metadata"
+profile_restic_repo="${backup_root}/${default_profile_repo_subdir}"
+restic_password_file="${backup_root}/.restic-password"
+
+if [[ -n "${snapshot_id}" ]]; then
+    if "${self_test}"; then
+        echo "Error: --snapshot is not supported with --self-test." >&2
+        exit 1
+    fi
+    if ! command -v restic >/dev/null 2>&1; then
+        echo "Error: restic not found." >&2
+        exit 1
+    fi
+    if [[ ! -f "${profile_restic_repo}/config" ]]; then
+        echo "Error: Profile restic repository missing: ${profile_restic_repo}" >&2
+        exit 1
+    fi
+    if ! have_restic_password; then
+        echo "Error: Restic password unavailable." >&2
+        echo "Set RESTIC_PASSWORD/RESTIC_PASSWORD_FILE or create: ${restic_password_file}" >&2
+        exit 1
+    fi
+
+    snapshot_restore_dir=$(mktemp -d)
+    echo "Extracting profile snapshot ${snapshot_id}..."
+    run_profile_restic "${profile_restic_repo}" restore "${snapshot_id}" --target "${snapshot_restore_dir}"
+
+    snapshot_src=$(find "${snapshot_restore_dir}" -type f -name prefs.js -printf '%h\n' | head -n1)
+    if [[ -z "${snapshot_src}" ]]; then
+        echo "Error: Restored snapshot does not contain a Thunderbird prefs.js file." >&2
+        exit 1
+    fi
+    src="${snapshot_src}/"
+    backup_root="${profile_restic_repo}"
+    profile_root_src=""
+    metadata_src=""
+fi
+
+# ── restore source listing ───────────────────────────────────────────────────
+if "${list}"; then
+    manifest_file="${src}/.backup_manifest"
+    manifest_date=""
+    manifest_profile=""
+    manifest_files=""
+    manifest_profile_size=""
+    manifest_tb_type=""
+    manifest_tb_version=""
+
+    if [[ -f "${manifest_file}" ]]; then
+        manifest_date=$(awk -F= '/^date=/{print $2}' "${manifest_file}")
+        manifest_profile=$(awk -F= '/^profile=/{print $2}' "${manifest_file}")
+        manifest_files=$(awk -F= '/^file_count=/{print $2}' "${manifest_file}")
+        manifest_profile_size=$(awk -F= '/^profile_size=/{print $2}' "${manifest_file}")
+        manifest_tb_type=$(awk -F= '/^thunderbird=/{print $2}' "${manifest_file}")
+        manifest_tb_version=$(awk -F= '/^thunderbird_version=/{print $2}' "${manifest_file}")
+    fi
+
+    last_restore=""
+    if [[ -f "${LAST_RESTORE_FILE}" ]]; then
+        last_restore=$(cat "${LAST_RESTORE_FILE}")
+    fi
+    profile_snapshot_status=""
+    profile_snapshot_output=""
+    if [[ -f "${profile_restic_repo}/config" ]]; then
+        if ! command -v restic >/dev/null 2>&1; then
+            profile_snapshot_status="unavailable (restic not installed)"
+        elif [[ -z "${RESTIC_PASSWORD:-}" && -z "${RESTIC_PASSWORD_FILE:-}" && ! -f "${restic_password_file}" ]]; then
+            profile_snapshot_status="unavailable (password missing)"
+        else
+            set +e
+            if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+                profile_snapshot_output=$(RESTIC_REPOSITORY="${profile_restic_repo}" restic snapshots --tag thunderbird-profile --compact 2>&1)
+            else
+                profile_snapshot_output=$(RESTIC_REPOSITORY="${profile_restic_repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic snapshots --tag thunderbird-profile --compact 2>&1)
+            fi
+            snapshot_status=$?
+            set -e
+            if [[ "${snapshot_status}" -eq 0 ]]; then
+                profile_snapshot_status="available"
+            else
+                profile_snapshot_status="unavailable (${profile_snapshot_output})"
+                profile_snapshot_output=""
+            fi
+        fi
+    else
+        profile_snapshot_status="not configured"
+    fi
+
+    cat <<EOF
+==============================
+  Restore Sources
+==============================
+  Mode:               latest profile mirror; profile snapshots listed when configured
+  Source:             ${src}
+  Backup root:        ${backup_root}
+  Backup date:        ${manifest_date:-(unknown)}
+  Thunderbird:        ${manifest_tb_type:-(unknown)} ${manifest_tb_version:-(unknown)}
+  Profile:            ${manifest_profile:-(unknown)}
+  Files:              ${manifest_files:-(unknown)}
+  Profile size:       ${manifest_profile_size:-(unknown)}
+  Last local restore: ${last_restore:-(never)}
+  Profile registry:   $([[ -f "${profile_root_src}/profiles.ini" ]] && echo "${profile_root_src}/profiles.ini" || echo "(missing)")
+  Install registry:   $([[ -f "${profile_root_src}/installs.ini" ]] && echo "${profile_root_src}/installs.ini" || echo "(missing)")
+  Metadata:           $([[ -d "${metadata_src}" ]] && echo "${metadata_src}" || echo "(missing)")
+  Profile snapshots:  ${profile_snapshot_status}
+==============================
+  Use --snapshot ID to restore from a listed profile snapshot.
+==============================
+EOF
+    if [[ -n "${profile_snapshot_output}" ]]; then
+        echo
+        echo "Profile Snapshot History"
+        printf '%s\n' "${profile_snapshot_output}"
+    fi
+    exit 0
+fi
 
 # ── upgrade check ─────────────────────────────────────────────────────────────
 if "${check}"; then

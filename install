@@ -22,6 +22,7 @@ SCRIPTS=(
     thunderbird-backup
     thunderbird-restore
     thunderbird-report
+    thunderbird-doctor
     thunderbird-localfolders-backup
     thunderbird-dedup-local
     install-native-host
@@ -86,7 +87,7 @@ check_deps() {
     local -A dep_users=(
         [python3]="tbblock-rebuild, thunderbird-restore, thunderbird-dedup-local, thunderbird-mbox-merge, tbblock-native-host, tbq-filter-audit"
         [rsync]="thunderbird-backup, thunderbird-restore"
-        [restic]="thunderbird-localfolders-backup"
+        [restic]="thunderbird-localfolders-backup, thunderbird-doctor"
         [flock]="tbblock, tbblock-native-host"
         [zip]="bundle"
     )

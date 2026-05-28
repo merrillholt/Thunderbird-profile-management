@@ -5,19 +5,47 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
+default_profile_repo_subdir="profile-restic"
 dry_run=false
 self_test=false
 self_test_root=""
+ownership_marker=".owned-by-thunderbird-backup"
+subcmd="backup"
+force_non_review=false
+NO_REVIEW_FILE="${HOME}/.config/tbblock/no-review"
+non_review_localfolders_only=false
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run] [--self-test]
+Usage: $(basename "$0") [--dry-run] [--self-test] [--force-non-review] [SUBCOMMAND]
+
+Subcommands (default: backup):
+  backup             Update the current profile mirror and snapshot if configured
+  init-profile-repo  Initialize the profile restic repository
+  profile-snapshots  List profile restic snapshots
 
 Options:
   --dry-run    Show what would be backed up without making changes
   --self-test  Run a safe self-test using temporary data
+  --force-non-review
+               Allow publishing the shared profile backup from a non-review machine
   -h, --help   Show this help
 EOF
+}
+
+have_restic_password() {
+    [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" || -f "${restic_password_file:-}" ]]
+}
+
+run_profile_restic() {
+    local repo="$1"
+    shift
+
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        RESTIC_REPOSITORY="${repo}" restic "$@"
+    else
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic "$@"
+    fi
 }
 
 run_rsync_capture() {
@@ -74,6 +102,52 @@ format_activity_table() {
     done
 }
 
+sync_backup_tree() {
+    local name="$1"
+    local source_dir="${local_staging}/${name}/"
+    local target_dir="${pcloud_backup_root}/${name}/"
+    local source_marker="${source_dir}${ownership_marker}"
+    local target_marker="${target_dir}${ownership_marker}"
+
+    if [[ ! -d "${source_dir}" ]]; then
+        return
+    fi
+
+    printf 'owner=thunderbird-backup\npath=%s\n' "${name}" > "${source_marker}"
+
+    if [[ -d "${target_dir}" && ! -f "${target_marker}" ]]; then
+        case "${name}" in
+            thunderbird)
+                if [[ ! -f "${target_dir}.backup_manifest" && ! -f "${target_dir}prefs.js" ]]; then
+                    echo "Error: Refusing destructive sync to unmarked directory: ${target_dir}" >&2
+                    exit 1
+                fi
+                ;;
+            profile-root)
+                if [[ ! -f "${target_dir}profiles.ini" ]]; then
+                    echo "Error: Refusing destructive sync to unmarked directory: ${target_dir}" >&2
+                    exit 1
+                fi
+                ;;
+            metadata)
+                if [[ ! -f "${target_dir}restore-context.env" ]]; then
+                    echo "Error: Refusing destructive sync to unmarked directory: ${target_dir}" >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "Error: Refusing destructive sync to unmarked directory: ${target_dir}" >&2
+                exit 1
+                ;;
+        esac
+        printf 'owner=thunderbird-backup\npath=%s\n' "${name}" > "${target_marker}"
+        echo "Marked existing backup-owned directory: ${target_dir}"
+    fi
+
+    mkdir -p "${target_dir}"
+    run_rsync_capture rsync -r --times --delete --no-perms --no-owner --no-group --no-devices --no-specials "${source_dir}" "${target_dir}"
+}
+
 get_manifest_date() {
     local manifest_file="$1"
     if [[ -f "${manifest_file}" ]]; then
@@ -85,6 +159,8 @@ for arg in "$@"; do
     case "${arg}" in
         --dry-run) dry_run=true ;;
         --self-test) self_test=true ;;
+        --force-non-review) force_non_review=true ;;
+        backup|init-profile-repo|profile-snapshots) subcmd="${arg}" ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "Error: Unknown option: ${arg}" >&2
@@ -148,6 +224,59 @@ fi
 
 profile_root_dest="${backup_root}/profile-root/"
 metadata_dest="${backup_root}/metadata/"
+profile_restic_repo="${pcloud_backup_root:+${pcloud_backup_root}/${default_profile_repo_subdir}}"
+restic_password_file="${pcloud_backup_root:+${pcloud_backup_root}/.restic-password}"
+
+if [[ "${subcmd}" == "backup" && "${self_test}" != true && -f "${NO_REVIEW_FILE}" && "${force_non_review}" != true ]]; then
+    non_review_localfolders_only=true
+fi
+
+if [[ "${subcmd}" == "init-profile-repo" ]]; then
+    if [[ -z "${profile_restic_repo}" ]]; then
+        echo "Error: No pCloud mount found for profile restic repository." >&2
+        exit 1
+    fi
+    if ! command -v restic >/dev/null 2>&1; then
+        echo "Error: restic not found." >&2
+        exit 1
+    fi
+    if "${dry_run}"; then
+        echo "Would initialize profile restic repository: ${profile_restic_repo}"
+    else
+        if ! have_restic_password; then
+            echo "Error: Restic password unavailable." >&2
+            echo "Set RESTIC_PASSWORD/RESTIC_PASSWORD_FILE or create: ${restic_password_file}" >&2
+            exit 1
+        fi
+        mkdir -p "${profile_restic_repo}"
+        run_profile_restic "${profile_restic_repo}" init
+        echo "Profile restic repository initialized: ${profile_restic_repo}"
+    fi
+    exit 0
+fi
+
+if [[ "${subcmd}" == "profile-snapshots" ]]; then
+    if [[ -z "${profile_restic_repo}" ]]; then
+        echo "Error: No pCloud mount found for profile restic repository." >&2
+        exit 1
+    fi
+    if ! command -v restic >/dev/null 2>&1; then
+        echo "Error: restic not found." >&2
+        exit 1
+    fi
+    if [[ ! -f "${profile_restic_repo}/config" ]]; then
+        echo "Error: Profile restic repository missing: ${profile_restic_repo}" >&2
+        echo "Run: $(basename "$0") init-profile-repo" >&2
+        exit 1
+    fi
+    if ! have_restic_password; then
+        echo "Error: Restic password unavailable." >&2
+        echo "Set RESTIC_PASSWORD/RESTIC_PASSWORD_FILE or create: ${restic_password_file}" >&2
+        exit 1
+    fi
+    run_profile_restic "${profile_restic_repo}" snapshots --tag thunderbird-profile
+    exit 0
+fi
 
 run_quick_check() {
     if command -v timeout >/dev/null 2>&1; then
@@ -210,6 +339,35 @@ if ! "${self_test}"; then
     tb_version=$(get_tb_version "${tb_type}")
 fi
 
+if "${non_review_localfolders_only}"; then
+    echo "Thunderbird Backup Status"
+    echo "  Thunderbird:             ${tb_type}"
+    echo "  Version:                 ${tb_version}"
+    echo "  Role:                    non-review"
+    echo "  Shared profile backup:   skipped"
+    echo "  Local Folders backup:    will run"
+    echo
+    echo "Backup Plan"
+    echo "  Command:                 ${SCRIPT_DIR}/thunderbird-localfolders-backup"
+    echo "  Override:                use --force-non-review to publish shared profile backup from this machine"
+    echo
+    set +e
+    if "${dry_run}"; then
+        "${SCRIPT_DIR}/thunderbird-localfolders-backup" --dry-run
+    else
+        "${SCRIPT_DIR}/thunderbird-localfolders-backup"
+    fi
+    lf_status=$?
+    set -e
+    if [[ "${lf_status}" -ne 0 ]]; then
+        echo
+        echo "Local Folders backup failed."
+        echo "If this is a new repository, initialize it once with:"
+        echo "  thunderbird-localfolders-backup init"
+    fi
+    exit "${lf_status}"
+fi
+
 profiles_ini="${tb_dir}/profiles.ini"
 
 if [[ ! -f "${profiles_ini}" ]]; then
@@ -254,6 +412,21 @@ if [[ -n "${pcloud_backup_root}" ]]; then
     pcloud_manifest_date=$(get_manifest_date "${pcloud_backup_root}/thunderbird/.backup_manifest")
 fi
 
+profile_snapshot_plan="not configured"
+if [[ -n "${profile_restic_repo}" ]]; then
+    if [[ -f "${profile_restic_repo}/config" ]]; then
+        if command -v restic >/dev/null 2>&1 && have_restic_password; then
+            profile_snapshot_plan="${profile_restic_repo}"
+        elif ! command -v restic >/dev/null 2>&1; then
+            profile_snapshot_plan="skipped (restic not installed)"
+        else
+            profile_snapshot_plan="skipped (password unavailable)"
+        fi
+    else
+        profile_snapshot_plan="skipped (repo missing; run thunderbird-backup init-profile-repo)"
+    fi
+fi
+
 echo "Thunderbird Backup Status"
 echo "  Thunderbird:        ${tb_type}"
 echo "  Version:            ${tb_version}"
@@ -278,11 +451,12 @@ else
     echo "  Source:             ${src}"
     echo "  Local backup:       ${dest}"
     if [[ -n "${pcloud_backup_root}" ]]; then
-        echo "  pCloud sync:        ${local_staging}/ -> ${pcloud_backup_root}/"
+        echo "  pCloud sync:        thunderbird/, profile-root/, metadata/, backup.log"
     fi
+    echo "  Profile snapshot:   ${profile_snapshot_plan}"
     echo "  Profile root copy:  ${profile_root_dest}"
     echo "  Metadata:           ${metadata_dest}"
-    echo "  Deletes:            Files removed from the profile will be removed from backup."
+    echo "  Deletes:            Removed files are deleted only inside backup-owned directories."
 fi
 echo
 
@@ -445,10 +619,37 @@ EOF
 
 echo "${report}"
 if ! "${dry_run}"; then
+    profile_snapshot_status="Skipped"
+    if [[ -n "${profile_restic_repo}" ]]; then
+        if [[ -f "${profile_restic_repo}/config" ]] && command -v restic >/dev/null 2>&1 && have_restic_password; then
+            echo "Creating profile restic snapshot..."
+            run_profile_restic "${profile_restic_repo}" backup \
+                --tag thunderbird \
+                --tag thunderbird-profile \
+                --host "$(hostname -s)" \
+                "${src}"
+            profile_snapshot_status="Complete"
+        elif [[ ! -f "${profile_restic_repo}/config" ]]; then
+            profile_snapshot_status="Skipped (repo missing)"
+            echo "Profile restic snapshot skipped: repository missing (${profile_restic_repo})."
+            echo "Run: thunderbird-backup init-profile-repo"
+        elif ! command -v restic >/dev/null 2>&1; then
+            profile_snapshot_status="Skipped (restic not installed)"
+            echo "Profile restic snapshot skipped: restic not installed."
+        else
+            profile_snapshot_status="Skipped (password unavailable)"
+            echo "Profile restic snapshot skipped: password unavailable (${restic_password_file})."
+        fi
+        echo
+    fi
     echo "${report}" >> "${log_file}"
     if [[ -n "${pcloud_backup_root}" ]]; then
         echo "Syncing local backup to pCloud..."
-        run_rsync_capture rsync -r --times --delete --no-perms --no-owner --no-group --no-devices --no-specials "${local_staging}/" "${pcloud_backup_root}/"
+        mkdir -p "${pcloud_backup_root}"
+        sync_backup_tree thunderbird
+        sync_backup_tree profile-root
+        sync_backup_tree metadata
+        run_rsync_capture rsync --times --no-perms --no-owner --no-group --no-devices --no-specials "${log_file}" "${pcloud_backup_root}/backup.log"
         echo "pCloud sync complete."
         if ! "${self_test}"; then
             log_activity "backup" "${pcloud_backup_root}/activity.log"
