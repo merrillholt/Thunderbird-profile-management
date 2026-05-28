@@ -198,7 +198,7 @@ if [[ -n "${pcloud_backup_root}" ]]; then
             else
                 fail "Restic local-folder snapshots are not readable"
             fi
-            if run_quick_check "${restic_env_prefix[@]}" restic check --read-data-subset=0%; then
+            if run_quick_check "${restic_env_prefix[@]}" restic check --no-lock --with-cache; then
                 ok "Restic repository metadata check passed"
             else
                 warn "Restic repository metadata check failed or timed out"
