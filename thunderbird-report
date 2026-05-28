@@ -7,6 +7,7 @@ backup_root_rel="Thunderbird Backup"
 local_staging="${HOME}/.local/share/thunderbird-backup"
 LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
 NO_REVIEW_FILE="${HOME}/.config/tbblock/no-review"
+TB_FLATPAK_APP_ID=""
 
 usage() {
     cat <<EOF
@@ -35,10 +36,21 @@ run_quick_check() {
     fi
 }
 
+find_flatpak_thunderbird() {
+    local app_id
+    for app_id in org.mozilla.thunderbird_esr org.mozilla.thunderbird org.mozilla.Thunderbird; do
+        if command -v flatpak &>/dev/null && run_quick_check flatpak info "${app_id}"; then
+            printf '%s\n' "${app_id}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 check_thunderbird_running() {
     pgrep -x thunderbird &>/dev/null || \
     pgrep -x thunderbird-bin &>/dev/null || \
-    { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
+    { command -v flatpak &>/dev/null && flatpak ps --columns=application 2>/dev/null | grep -Eq '^(org\.mozilla\.thunderbird_esr|org\.mozilla\.thunderbird|org\.mozilla\.Thunderbird)$'; }
 }
 
 format_activity_table() {
@@ -79,9 +91,9 @@ else
 fi
 
 # ── Thunderbird ───────────────────────────────────────────────────────────────
-if command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird; then
+if TB_FLATPAK_APP_ID=$(find_flatpak_thunderbird); then
     tb_type="Flatpak"
-    tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+    tb_dir="${HOME}/.var/app/${TB_FLATPAK_APP_ID}/.thunderbird"
 elif command -v snap &>/dev/null && run_quick_check snap list thunderbird; then
     tb_type="Snap"
     tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
@@ -95,7 +107,7 @@ fi
 
 tb_version="unknown"
 if [[ "${tb_type}" == "Flatpak" ]]; then
-    tb_version=$(timeout 5s flatpak info org.mozilla.Thunderbird 2>/dev/null \
+    tb_version=$(timeout 5s flatpak info "${TB_FLATPAK_APP_ID}" 2>/dev/null \
         | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
 elif [[ "${tb_type}" != "not found" ]] && command -v thunderbird &>/dev/null; then
     tb_version=$(thunderbird --version 2>/dev/null | awk '{print $2}' || true)

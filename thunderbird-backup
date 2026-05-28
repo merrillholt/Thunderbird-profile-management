@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
@@ -156,11 +157,22 @@ run_quick_check() {
     fi
 }
 
+find_flatpak_thunderbird() {
+    local app_id
+    for app_id in org.mozilla.thunderbird_esr org.mozilla.thunderbird org.mozilla.Thunderbird; do
+        if command -v flatpak &>/dev/null && run_quick_check flatpak info "${app_id}"; then
+            printf '%s\n' "${app_id}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Detect Thunderbird installation and set profile directory accordingly
 if ! "${self_test}"; then
-    if command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird; then
+    if TB_FLATPAK_APP_ID=$(find_flatpak_thunderbird); then
         tb_type="Flatpak"
-        tb_dir="${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+        tb_dir="${HOME}/.var/app/${TB_FLATPAK_APP_ID}/.thunderbird"
     elif command -v snap &>/dev/null && run_quick_check snap list thunderbird; then
         tb_type="Snap"
         tb_dir="${HOME}/snap/thunderbird/common/.thunderbird"
@@ -179,9 +191,9 @@ get_tb_version() {
     case "${detected_type}" in
         Flatpak)
             if command -v timeout >/dev/null 2>&1; then
-                version=$(timeout 5s flatpak info org.mozilla.Thunderbird 2>/dev/null | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
+                version=$(timeout 5s flatpak info "${TB_FLATPAK_APP_ID}" 2>/dev/null | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
             else
-                version=$(flatpak info org.mozilla.Thunderbird 2>/dev/null | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
+                version=$(flatpak info "${TB_FLATPAK_APP_ID}" 2>/dev/null | awk -F': *' '/^[[:space:]]*Version:/{print $2}' || true)
             fi
             ;;
         *)
@@ -205,119 +217,12 @@ if [[ ! -f "${profiles_ini}" ]]; then
     exit 1
 fi
 
-select_install_default() {
-    local ini="$1"
-    local base_dir="$2"
-    local line section def locked resolved
-    declare -A seen_existing_locked=()
-    declare -A seen_existing=()
-    declare -A seen_any=()
-    local existing_locked_count=0
-    local existing_count=0
-    local any_count=0
-    local first_existing_locked=""
-    local first_existing=""
-    local first_any=""
-
-    while IFS='|' read -r section def locked; do
-        [[ -n "${def}" ]] || continue
-        if [[ "${def}" = /* ]]; then
-            resolved="${def}"
-        else
-            resolved="${base_dir}/${def}"
-        fi
-
-        if [[ -z "${seen_any[${def}]+x}" ]]; then
-            seen_any["${def}"]=1
-            ((any_count++)) || true
-            [[ -z "${first_any}" ]] && first_any="${def}"
-        fi
-
-        if [[ -d "${resolved}" ]]; then
-            if [[ -z "${seen_existing[${def}]+x}" ]]; then
-                seen_existing["${def}"]=1
-                ((existing_count++)) || true
-                [[ -z "${first_existing}" ]] && first_existing="${def}"
-            fi
-            if [[ "${locked}" == "1" && -z "${seen_existing_locked[${def}]+x}" ]]; then
-                seen_existing_locked["${def}"]=1
-                ((existing_locked_count++)) || true
-                [[ -z "${first_existing_locked}" ]] && first_existing_locked="${def}"
-            fi
-        fi
-    done < <(
-        awk -F= '
-            /^\[Install[^]]*\]/ {
-                if (in_install && def != "") print section "|" def "|" locked
-                in_install=1
-                section=$0
-                gsub(/^\[/, "", section)
-                gsub(/\]$/, "", section)
-                def=""
-                locked="0"
-                next
-            }
-            /^\[/ {
-                if (in_install && def != "") print section "|" def "|" locked
-                in_install=0
-                next
-            }
-            in_install && /^Default=/ { def=$2 }
-            in_install && /^Locked=1$/ { locked="1" }
-            END {
-                if (in_install && def != "") print section "|" def "|" locked
-            }
-        ' "${ini}"
-    )
-
-    if (( existing_locked_count == 1 )); then
-        echo "${first_existing_locked}"
-    elif (( existing_count == 1 )); then
-        echo "${first_existing}"
-    elif (( any_count == 1 )); then
-        echo "${first_any}"
-    fi
+# Determine active profile path.
+profile_path=$(python3 "${SCRIPT_DIR}/thunderbird_profile.py" "${tb_dir}") || {
+    echo "Error: Could not determine active Thunderbird profile from ${tb_dir}/profiles.ini" >&2
+    exit 1
 }
-
-# Determine active profile from [Install*] sections.
-# If ambiguous/missing, fallback to Profile Default=1.
-active_profile=$(select_install_default "${profiles_ini}" "${tb_dir}")
-
-if [[ -n "${active_profile}" ]]; then
-    if [[ "${active_profile}" = /* ]]; then
-        profile_path="${active_profile}"
-    else
-        profile_path="${tb_dir}/${active_profile}"
-    fi
-else
-    profile_info=$(awk -F= '
-        /^\[Profile/ {
-            if (in_profile && is_default && path != "") {print path "|" rel; exit}
-            in_profile=1; is_default=0; path=""; rel=""
-        }
-        /^\[/ && $0 !~ /^\[Profile/ {in_profile=0}
-        in_profile && /^Default=1/ {is_default=1}
-        in_profile && /^Path=/ {path=$2}
-        in_profile && /^IsRelative=/ {rel=$2}
-        END {
-            if (is_default && path != "") {print path "|" rel}
-        }
-    ' "${profiles_ini}")
-
-    profile_rel="${profile_info##*|}"
-    profile_path_raw="${profile_info%%|*}"
-
-    if [[ -z "${profile_path_raw}" ]]; then
-        echo "Error: Could not determine active Thunderbird profile from ${profiles_ini}" >&2
-        exit 1
-    fi
-
-    if [[ "${profile_rel}" = "1" ]]; then
-        profile_path="${tb_dir}/${profile_path_raw}"
-    else
-        profile_path="${profile_path_raw}"
-    fi
-fi
+active_profile=$(basename "${profile_path}")
 
 if [[ ! -d "${profile_path}" ]]; then
     echo "Error: Thunderbird profile directory not found: ${profile_path}" >&2
@@ -329,7 +234,7 @@ src="${profile_path}/"
 check_thunderbird_running() {
     pgrep -x thunderbird &>/dev/null || \
     pgrep -x thunderbird-bin &>/dev/null || \
-    { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
+    { command -v flatpak &>/dev/null && flatpak ps --columns=application 2>/dev/null | grep -Eq '^(org\.mozilla\.thunderbird_esr|org\.mozilla\.thunderbird|org\.mozilla\.Thunderbird)$'; }
 }
 
 if [[ ! -f "${src}/prefs.js" ]]; then
@@ -401,7 +306,9 @@ if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
         exit 1
     fi
     pkill -x thunderbird 2>/dev/null || true
-    flatpak kill org.mozilla.Thunderbird 2>/dev/null || true
+    if [[ "${tb_type}" == "Flatpak" ]]; then
+        flatpak kill "${TB_FLATPAK_APP_ID}" 2>/dev/null || true
+    fi
     sleep 2
     if check_thunderbird_running; then
         echo "Error: Thunderbird is still running. Please close it manually and retry." >&2
@@ -438,10 +345,10 @@ else
         echo "profile_path=${profile_path}"
     } > "${metadata_dest}/restore-context.env"
     if [[ "${tb_type}" == "Flatpak" ]] && command -v flatpak >/dev/null 2>&1; then
-        flatpak info org.mozilla.Thunderbird > "${metadata_dest}/flatpak-info.txt" 2>&1 || true
-        flatpak info --show-permissions org.mozilla.Thunderbird > "${metadata_dest}/flatpak-permissions.txt" 2>&1 || true
-        flatpak override --user --show org.mozilla.Thunderbird > "${metadata_dest}/flatpak-override-user.txt" 2>&1 || true
-        flatpak override --system --show org.mozilla.Thunderbird > "${metadata_dest}/flatpak-override-system.txt" 2>&1 || true
+        flatpak info "${TB_FLATPAK_APP_ID}" > "${metadata_dest}/flatpak-info.txt" 2>&1 || true
+        flatpak info --show-permissions "${TB_FLATPAK_APP_ID}" > "${metadata_dest}/flatpak-permissions.txt" 2>&1 || true
+        flatpak override --user --show "${TB_FLATPAK_APP_ID}" > "${metadata_dest}/flatpak-override-user.txt" 2>&1 || true
+        flatpak override --system --show "${TB_FLATPAK_APP_ID}" > "${metadata_dest}/flatpak-override-system.txt" 2>&1 || true
         flatpak remotes --columns=name,url,options > "${metadata_dest}/flatpak-remotes.txt" 2>&1 || true
         flatpak list --app --columns=application,branch,origin,installation,version > "${metadata_dest}/flatpak-apps.txt" 2>&1 || true
         flatpak list --runtime --columns=application,branch,origin,installation,version > "${metadata_dest}/flatpak-runtimes.txt" 2>&1 || true

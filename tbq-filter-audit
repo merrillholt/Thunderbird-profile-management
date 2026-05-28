@@ -22,9 +22,6 @@ from typing import Iterable
 
 from thunderbird_profile import find_default_profile
 
-DEFAULT_PROFILE = find_default_profile()
-
-
 def find_default_rules(profile: Path) -> dict[str, Path]:
     rules = {}
     for dat in sorted((profile / "ImapMail").glob("*/msgFilterRules.dat")):
@@ -32,8 +29,14 @@ def find_default_rules(profile: Path) -> dict[str, Path]:
     return rules
 
 
-DEFAULT_RULES = find_default_rules(DEFAULT_PROFILE)
-DEFAULT_FOLDER = DEFAULT_PROFILE / "Mail/Local Folders/Review"
+try:
+    DEFAULT_PROFILE: Path | None = find_default_profile()
+    DEFAULT_RULES: dict[str, Path] = find_default_rules(DEFAULT_PROFILE)
+    DEFAULT_FOLDER: Path | None = DEFAULT_PROFILE / "Mail/Local Folders/Review"
+except RuntimeError:
+    DEFAULT_PROFILE = None
+    DEFAULT_RULES = {}
+    DEFAULT_FOLDER = None
 
 
 @dataclass
@@ -621,6 +624,12 @@ def main() -> int:
     )
     parser.add_argument("-i", "--interactive", action="store_true", help="Prompt for options interactively.")
     args = parser.parse_args()
+
+    if args.profile is None:
+        print("Error: No Thunderbird profile found. Use --profile to specify one.", file=sys.stderr)
+        return 2
+    if args.folder is None:
+        args.folder = args.profile / "Mail/Local Folders/Review"
 
     if args.interactive:
         args = interactive_prompt(args, parser)

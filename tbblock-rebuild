@@ -58,7 +58,12 @@ def is_tb_running() -> bool:
             capture_output=True,
             text=True,
         )
-        if r.returncode == 0 and "org.mozilla.Thunderbird" in r.stdout.splitlines():
+        flatpak_ids = {
+            "org.mozilla.thunderbird_esr",
+            "org.mozilla.thunderbird",
+            "org.mozilla.Thunderbird",
+        }
+        if r.returncode == 0 and flatpak_ids.intersection(r.stdout.splitlines()):
             return True
     except FileNotFoundError:
         pass
@@ -256,7 +261,7 @@ def write_route_filters(path: Path, routes: dict[str, set[str]], profile: Path) 
     if new_route_blocks:
         anchor = next(
             (i for i, b in enumerate(blocks) if block_name(b) == ROUTE_INSERT_BEFORE),
-            0,
+            len(blocks),
         )
         for j, nb in enumerate(new_route_blocks):
             blocks.insert(anchor + j, nb)

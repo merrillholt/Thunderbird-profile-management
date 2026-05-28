@@ -17,6 +17,9 @@ MANIFEST_FILE="${MANIFEST_DIR}/${HOST_NAME}.json"
 
 # Sandbox grant for the manifest directory (overrides !home for this path).
 NMH_FLATPAK_FS="${HOME}/.mozilla/native-messaging-hosts:ro"
+TB_FLATPAK_APP_ID=""
+TB_FLATPAK_APP_IDS=()
+FLATPAK_APP_IDS=(org.mozilla.thunderbird_esr org.mozilla.thunderbird org.mozilla.Thunderbird)
 
 usage() {
   cat <<EOF
@@ -40,17 +43,28 @@ for arg in "$@"; do
   esac
 done
 
-if ! command -v flatpak &>/dev/null || ! flatpak info org.mozilla.Thunderbird &>/dev/null; then
-  echo "Error: Flatpak Thunderbird (org.mozilla.Thunderbird) not found." >&2
+for app_id in "${FLATPAK_APP_IDS[@]}"; do
+  if command -v flatpak &>/dev/null && flatpak info "${app_id}" &>/dev/null; then
+    TB_FLATPAK_APP_IDS+=("${app_id}")
+    [[ -z "${TB_FLATPAK_APP_ID}" ]] && TB_FLATPAK_APP_ID="${app_id}"
+  fi
+done
+
+if (( ${#TB_FLATPAK_APP_IDS[@]} == 0 )); then
+  echo "Error: Flatpak Thunderbird not found." >&2
   exit 1
 fi
 
 if "${uninstall}"; then
   rm -f "${MANIFEST_FILE}" && echo "Removed: ${MANIFEST_FILE}" || echo "Not found: ${MANIFEST_FILE}"
   # Remove legacy path written by earlier version of this script
-  rm -f "${HOME}/.var/app/org.mozilla.Thunderbird/.mozilla/native-messaging-hosts/${HOST_NAME}.json" 2>/dev/null || true
-  flatpak override --user org.mozilla.Thunderbird --nofilesystem="${NMH_FLATPAK_FS%:ro}" 2>/dev/null || true
-  flatpak override --user org.mozilla.Thunderbird --nofilesystem="${SCRIPT_DIR%:ro}" 2>/dev/null || true
+  for app_id in "${FLATPAK_APP_IDS[@]}"; do
+    rm -f "${HOME}/.var/app/${app_id}/.mozilla/native-messaging-hosts/${HOST_NAME}.json" 2>/dev/null || true
+  done
+  for app_id in "${TB_FLATPAK_APP_IDS[@]}"; do
+    flatpak override --user "${app_id}" --nofilesystem="${NMH_FLATPAK_FS%:ro}" 2>/dev/null || true
+    flatpak override --user "${app_id}" --nofilesystem="${SCRIPT_DIR%:ro}" 2>/dev/null || true
+  done
   echo "Flatpak filesystem overrides revoked."
   exit 0
 fi
@@ -75,9 +89,11 @@ echo "Installed: ${MANIFEST_FILE}"
 
 # Grant the sandbox read access to the manifest directory and the host script.
 # The ~/.mozilla/native-messaging-hosts grant overrides !home for that path.
-flatpak override --user org.mozilla.Thunderbird --filesystem="${NMH_FLATPAK_FS}"
-echo "Flatpak override applied: filesystem=${NMH_FLATPAK_FS}"
-flatpak override --user org.mozilla.Thunderbird --filesystem="${SCRIPT_DIR}"
-echo "Flatpak override applied: filesystem=${SCRIPT_DIR}"
+for app_id in "${TB_FLATPAK_APP_IDS[@]}"; do
+  flatpak override --user "${app_id}" --filesystem="${NMH_FLATPAK_FS}"
+  echo "Flatpak override applied for ${app_id}: filesystem=${NMH_FLATPAK_FS}"
+  flatpak override --user "${app_id}" --filesystem="${SCRIPT_DIR}"
+  echo "Flatpak override applied for ${app_id}: filesystem=${SCRIPT_DIR}"
+done
 echo
 echo "Done. Restart Thunderbird to activate the native messaging host."

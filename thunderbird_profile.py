@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 THUNDERBIRD_DIRS = [
+    Path.home() / ".var/app/org.mozilla.thunderbird_esr/.thunderbird",
+    Path.home() / ".var/app/org.mozilla.thunderbird/.thunderbird",
     Path.home() / ".var/app/org.mozilla.Thunderbird/.thunderbird",
     Path.home() / "snap/thunderbird/common/.thunderbird",
     Path.home() / ".thunderbird",
@@ -50,3 +52,13 @@ def find_default_profile(tb_dir: Path | None = None) -> Path:
     if candidates:
         return candidates[0]
     raise RuntimeError(f"No Thunderbird profile found in {tb_dir}")
+
+
+if __name__ == "__main__":
+    import sys
+    try:
+        tb_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+        print(find_default_profile(tb_dir))
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)

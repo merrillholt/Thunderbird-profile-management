@@ -74,6 +74,25 @@ run_quick_check() {
     fi
 }
 
+find_flatpak_thunderbird_dir() {
+    local app_id
+    for app_id in org.mozilla.thunderbird_esr org.mozilla.thunderbird org.mozilla.Thunderbird; do
+        if command -v flatpak &>/dev/null && run_quick_check flatpak info "${app_id}"; then
+            printf '%s\n' "${HOME}/.var/app/${app_id}/.thunderbird"
+            return 0
+        fi
+    done
+    for app_id in org.mozilla.thunderbird_esr org.mozilla.thunderbird org.mozilla.Thunderbird; do
+        if [[ -d "${HOME}/.var/app/${app_id}/.thunderbird" ]]; then
+            printf '%s\n' "${HOME}/.var/app/${app_id}/.thunderbird"
+            return 0
+        fi
+    done
+    printf '%s\n' "${HOME}/.var/app/org.mozilla.Thunderbird/.thunderbird"
+}
+
+tb_dirs["Flatpak"]="$(find_flatpak_thunderbird_dir)"
+
 is_installed() {
     local tb_type="$1"
     case "${tb_type}" in
@@ -81,7 +100,11 @@ is_installed() {
             command -v thunderbird &>/dev/null && [[ ! $(which thunderbird) =~ snap ]]
             ;;
         Flatpak)
-            command -v flatpak &>/dev/null && run_quick_check flatpak info org.mozilla.Thunderbird
+            command -v flatpak &>/dev/null && {
+                run_quick_check flatpak info org.mozilla.thunderbird_esr ||
+                run_quick_check flatpak info org.mozilla.thunderbird ||
+                run_quick_check flatpak info org.mozilla.Thunderbird
+            }
             ;;
         Snap)
             command -v snap &>/dev/null && run_quick_check snap list thunderbird
