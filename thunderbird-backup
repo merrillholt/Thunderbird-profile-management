@@ -73,6 +73,13 @@ format_activity_table() {
     done
 }
 
+get_manifest_date() {
+    local manifest_file="$1"
+    if [[ -f "${manifest_file}" ]]; then
+        awk -F= '/^date=/{print $2; exit}' "${manifest_file}"
+    fi
+}
+
 for arg in "$@"; do
     case "${arg}" in
         --dry-run) dry_run=true ;;
@@ -115,14 +122,14 @@ EOF
 
 pcloud_backup_root=""
 local_staging=""
+pcloud_writable=true
 
 if "${self_test}"; then
     setup_self_test
 else
     if [[ -d "${pcloud_mount}" ]]; then
         if ! "${dry_run}" && [[ ! -w "${pcloud_mount}" ]]; then
-            echo "Error: ${pcloud_mount} is not writable." >&2
-            exit 1
+            pcloud_writable=false
         fi
         pcloud_backup_root="${pcloud_mount}/${backup_root_rel}"
     elif [[ -d "${pcloud_drive}" ]]; then
@@ -319,17 +326,72 @@ fi
 
 src="${profile_path}/"
 
-echo "Thunderbird: ${tb_type}"
-echo "Version: ${tb_version}"
-echo "Active profile: ${active_profile}"
-echo "Backing up from ${src} to ${dest}"
-echo
-
 check_thunderbird_running() {
     pgrep -x thunderbird &>/dev/null || \
     pgrep -x thunderbird-bin &>/dev/null || \
     { command -v flatpak &>/dev/null && flatpak ps 2>/dev/null | grep -q org.mozilla.Thunderbird; }
 }
+
+if [[ ! -f "${src}/prefs.js" ]]; then
+    echo "Error: Source does not look like a Thunderbird profile: ${src}" >&2
+    exit 1
+fi
+
+if ! "${self_test}" && check_thunderbird_running; then
+    thunderbird_status="running"
+else
+    thunderbird_status="not running"
+fi
+
+local_manifest_date=$(get_manifest_date "${dest}/.backup_manifest")
+pcloud_manifest_date=""
+if [[ -n "${pcloud_backup_root}" ]]; then
+    pcloud_manifest_date=$(get_manifest_date "${pcloud_backup_root}/thunderbird/.backup_manifest")
+fi
+
+echo "Thunderbird Backup Status"
+echo "  Thunderbird:        ${tb_type}"
+echo "  Version:            ${tb_version}"
+echo "  Active profile:     ${active_profile}"
+echo "  Thunderbird status: ${thunderbird_status}"
+echo "  Last local backup:  ${local_manifest_date:-(none)}"
+if [[ -n "${pcloud_backup_root}" ]]; then
+    echo "  Last pCloud backup: ${pcloud_manifest_date:-(none)}"
+    if "${pcloud_writable}"; then
+        echo "  pCloud writable:    yes"
+    else
+        echo "  pCloud writable:    no (${pcloud_mount})"
+    fi
+fi
+echo
+echo "Backup Plan"
+if "${dry_run}"; then
+    echo "  Mode:               Dry run only; no files will be changed."
+    echo "  Profile scan:       ${src}"
+    echo "  Compare against:    ${dest}"
+else
+    echo "  Source:             ${src}"
+    echo "  Local backup:       ${dest}"
+    if [[ -n "${pcloud_backup_root}" ]]; then
+        echo "  pCloud sync:        ${local_staging}/ -> ${pcloud_backup_root}/"
+    fi
+    echo "  Profile root copy:  ${profile_root_dest}"
+    echo "  Metadata:           ${metadata_dest}"
+    echo "  Deletes:            Files removed from the profile will be removed from backup."
+fi
+echo
+
+if ! "${dry_run}" && ! "${self_test}"; then
+    read -rp "Continue with backup? [y/N] " confirm
+    if [[ "${confirm}" != [yY] ]]; then
+        echo "Backup cancelled."
+        exit 0
+    fi
+    if ! "${pcloud_writable}"; then
+        echo "Error: ${pcloud_mount} is not writable." >&2
+        exit 1
+    fi
+fi
 
 if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
     echo "Thunderbird is running."
@@ -345,11 +407,6 @@ if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
         echo "Error: Thunderbird is still running. Please close it manually and retry." >&2
         exit 1
     fi
-fi
-
-if [[ ! -f "${src}/prefs.js" ]]; then
-    echo "Error: Source does not look like a Thunderbird profile: ${src}" >&2
-    exit 1
 fi
 
 start_time=$(date +%s)
