@@ -5,8 +5,9 @@ pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
 local_staging="${HOME}/.local/share/thunderbird-backup"
+aux_dir="${local_staging}/aux"
 LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
-ownership_marker=".owned-by-thunderbird-backup"
+NO_REVIEW_FILE="${HOME}/.config/tbblock/no-review"
 default_repo_subdir="localfolders-restic"
 default_profile_repo_subdir="profile-restic"
 timers=(
@@ -19,7 +20,7 @@ usage() {
 Usage: $(basename "$0")
 
 Run read-only health checks for Thunderbird backup, restore, Local Folders restic,
-pCloud state, timers, and destructive-sync safety markers.
+profile restic repository, pCloud state, timers, and install links.
 EOF
 }
 
@@ -53,23 +54,6 @@ fail() {
     (( fail_count++ )) || true
 }
 
-check_file() {
-    local path="$1"
-    local label="$2"
-    if [[ -f "${path}" ]]; then
-        ok "${label}: ${path}"
-    else
-        fail "${label} missing: ${path}"
-    fi
-}
-
-get_manifest_value() {
-    local manifest="$1"
-    local key="$2"
-    [[ -f "${manifest}" ]] || return 0
-    awk -F= -v key="${key}" '$1 == key { print $2; exit }' "${manifest}"
-}
-
 run_quick_check() {
     if command -v timeout >/dev/null 2>&1; then
         timeout 10s "$@" >/dev/null 2>&1
@@ -80,9 +64,16 @@ run_quick_check() {
 
 restic_env_prefix=()
 
+if [[ -f "${NO_REVIEW_FILE}" ]]; then
+    role="non-review"
+else
+    role="review"
+fi
+
 echo "Thunderbird Backup Doctor"
 echo "Date:    $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Machine: $(hostname -s)"
+echo "Role:    ${role}"
 echo
 
 if [[ -d "${pcloud_mount}" ]]; then
@@ -111,54 +102,50 @@ if [[ -n "${pcloud_backup_root}" ]]; then
 fi
 
 echo
-echo "Profile Backup"
+echo "Profile Restic"
 
+profile_restic_env=()
 if [[ -n "${pcloud_backup_root}" ]]; then
-    profile_backup="${pcloud_backup_root}/thunderbird"
     profile_repo="${pcloud_backup_root}/${default_profile_repo_subdir}"
-    manifest="${profile_backup}/.backup_manifest"
-
-    if [[ -d "${profile_backup}" ]]; then
-        ok "Current compatibility mirror exists"
-    else
-        fail "Current compatibility mirror missing: ${profile_backup}"
-    fi
-
-    check_file "${manifest}" "Current mirror manifest"
-    check_file "${profile_backup}/prefs.js" "Current mirror prefs.js"
-
-    manifest_date=$(get_manifest_value "${manifest}" date)
-    manifest_profile=$(get_manifest_value "${manifest}" profile)
-    if [[ -n "${manifest_date}" ]]; then
-        ok "Current mirror date: ${manifest_date}"
-    else
-        warn "Current mirror date unavailable"
-    fi
-    if [[ -n "${manifest_profile}" ]]; then
-        ok "Profile backup profile: ${manifest_profile}"
-    else
-        warn "Profile backup profile unavailable"
-    fi
-
-    for owned_dir in thunderbird profile-root metadata; do
-        dir="${pcloud_backup_root}/${owned_dir}"
-        marker="${dir}/${ownership_marker}"
-        if [[ -d "${dir}" ]]; then
-            if [[ -f "${marker}" ]]; then
-                ok "Safety marker present: ${owned_dir}/${ownership_marker}"
-            else
-                warn "Safety marker missing until next backup marks existing directory: ${owned_dir}/${ownership_marker}"
-            fi
-        else
-            warn "Backup-owned directory missing: ${owned_dir}"
-        fi
-    done
+    profile_pw_file="${pcloud_backup_root}/.restic-password"
 
     if [[ -f "${profile_repo}/config" ]]; then
-        ok "Durable profile restic repository exists"
+        ok "Profile restic repository exists"
+    elif [[ "${role}" == "review" ]]; then
+        fail "Profile restic repository missing: ${profile_repo}"
+        echo "      Initialize with: thunderbird-backup init-profile-repo"
     else
-        warn "Durable profile restic repository not initialized: ${profile_repo}"
+        warn "Profile restic repository missing (non-review machine, may be expected): ${profile_repo}"
     fi
+
+    if [[ -f "${profile_pw_file}" ]]; then
+        profile_restic_env=(env "RESTIC_REPOSITORY=${profile_repo}" "RESTIC_PASSWORD_FILE=${profile_pw_file}")
+    elif [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        profile_restic_env=(env "RESTIC_REPOSITORY=${profile_repo}")
+    fi
+
+    if command -v restic >/dev/null 2>&1 && [[ -f "${profile_repo}/config" && ${#profile_restic_env[@]} -gt 0 ]]; then
+        if run_quick_check "${profile_restic_env[@]}" restic snapshots --tag thunderbird-profile; then
+            ok "Profile snapshots are readable"
+        else
+            fail "Profile snapshots are not readable"
+        fi
+        if run_quick_check "${profile_restic_env[@]}" restic check --no-lock --with-cache; then
+            ok "Profile restic repository metadata check passed"
+        else
+            warn "Profile restic repository metadata check failed or timed out"
+        fi
+    fi
+fi
+
+if [[ "${role}" == "review" ]]; then
+    if [[ -d "${aux_dir}" ]]; then
+        ok "Aux staging exists: ${aux_dir}"
+    else
+        warn "Aux staging not yet populated: ${aux_dir} (created on next backup)"
+    fi
+else
+    ok "Aux staging not used on non-review machines"
 fi
 
 echo

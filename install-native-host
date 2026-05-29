@@ -96,4 +96,4 @@ for app_id in "${TB_FLATPAK_APP_IDS[@]}"; do
   echo "Flatpak override applied for ${app_id}: filesystem=${SCRIPT_DIR}"
 done
 echo
-echo "Done. Restart Thunderbird to activate the native messaging host."
+echo "install-native-host: Done. Restart Thunderbird to activate the native messaging host."

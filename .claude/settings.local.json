@@ -25,7 +25,21 @@
       "Bash(flatpak info *)",
       "Bash(flatpak run *)",
       "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/install-native-host)",
-      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/thunderbird-backup)"
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/thunderbird-backup)",
+      "Bash(chmod +x /mnt/pcloud/bin/thunderbird-tools/thunderbird-backup)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-backup --self-test)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-backup --self-test --dry-run)",
+      "Bash(chmod +x /mnt/pcloud/bin/thunderbird-tools/thunderbird-restore)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-restore --self-test)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-restore --self-test --list)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-restore --self-test --check)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/thunderbird-doctor)",
+      "Bash(chmod +x /mnt/pcloud/bin/thunderbird-tools/thunderbird-doctor)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-doctor)",
+      "Bash(bash -n /mnt/pcloud/bin/thunderbird-tools/thunderbird-report)",
+      "Bash(chmod +x /mnt/pcloud/bin/thunderbird-tools/thunderbird-report)",
+      "Bash(/mnt/pcloud/bin/thunderbird-tools/thunderbird-report)"
     ]
   }
 }

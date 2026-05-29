@@ -4,7 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 MERGE_HELPER="${SCRIPT_DIR}/thunderbird-mbox-merge"
 
-log_file="${HOME}/thunderbird-restore.log"
+pcloud_mount="/mnt/pcloud"
+pcloud_drive="${HOME}/pCloudDrive"
+backup_root_rel="Thunderbird Backup"
+default_profile_repo_subdir="profile-restic"
+activity_fallback="${HOME}/.local/share/thunderbird-backup/activity.log.fallback"
+
 dry_run=false
 self_test=false
 self_test_root=""
@@ -15,39 +20,37 @@ snapshot_id=""
 merge_work_dir=""
 snapshot_restore_dir=""
 merge_status="Skipped"
-manifest_date=""
 
 LAST_RESTORE_FILE="${HOME}/.config/tbblock/last-restore"
 
 trap '[[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"; [[ -n "${snapshot_restore_dir:-}" ]] && rm -rf "${snapshot_restore_dir}"' EXIT
 
-run_rsync_capture() {
-    local output status
+have_restic_password() {
+    [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" || -f "${restic_password_file:-}" ]]
+}
 
-    set +e
-    output=$("$@" 2>&1)
-    status=$?
-    set -e
+run_profile_restic() {
+    local repo="$1"
+    shift
 
-    case "${status}" in
-        0)
-            ;;
-        24)
-            echo "Warning: rsync reported vanished source files (exit code 24)." >&2
-            echo "This usually means the backup tree changed during restore; rerun once pCloud is fully synced if anything looks incomplete." >&2
-            ;;
-        *)
-            printf '%s\n' "${output}" >&2
-            return "${status}"
-            ;;
-    esac
-
-    printf '%s\n' "${output}"
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        RESTIC_REPOSITORY="${repo}" restic "$@"
+    else
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic "$@"
+    fi
 }
 
 log_activity() {
-    local action="$1" log_path="$2"
-    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "${action}" >> "${log_path}"
+    local action="$1" status="$2" detail="$3" log_path="$4"
+    local line
+    line=$(printf '%s\t%s\t%s\t%s\t%s' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "${action}" "${status}" "${detail}")
+    if [[ -n "${log_path}" ]] && printf '%s\n' "${line}" >> "${log_path}" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${activity_fallback}")"
+    printf '%s\n' "${line}" >> "${activity_fallback}"
+    echo "Warning: could not write activity log to ${log_path:-(unset)}; appended to ${activity_fallback}" >&2
+    return 0
 }
 
 format_activity_table() {
@@ -56,21 +59,28 @@ format_activity_table() {
         printf '  (no activity recorded yet)\n'
         return
     fi
-    printf '  %-20s  %-22s  %-22s\n' "Computer" "Last Backup" "Last Restore"
-    printf '  %-20s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------"
+    printf '  %-20s  %-22s  %-22s  %-22s  %-10s\n' "Computer" "Last Backup" "Last LF Backup" "Last Restore" "Status"
+    printf '  %-20s  %-22s  %-22s  %-22s  %-10s\n' "--------------------" "----------------------" "----------------------" "----------------------" "----------"
     awk -F'\t' '
-        NF == 3 {
+        NF >= 3 {
             host=$2; action=$3; date=$1
-            if (action=="backup"  && (!(host in b) || date>b[host])) b[host]=date
-            if (action=="restore" && (!(host in r) || date>r[host])) r[host]=date
+            status=(NF >= 4 ? $4 : "ok")
+            if (action=="backup"             && (!(host in b)  || date>b[host]))  { b[host]=date;  bs[host]=status }
+            if (action=="localfolders-backup" && (!(host in lf) || date>lf[host])) { lf[host]=date; ls[host]=status }
+            if (action=="restore"            && (!(host in r)  || date>r[host]))  { r[host]=date;  rs[host]=status }
+            if (!(host in last) || date>last[host]) { last[host]=date; lasts[host]=status }
             seen[host]=1
         }
         END {
             for (host in seen)
-                printf "%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in r ? r[host] : "-")
+                printf "%s\t%s\t%s\t%s\t%s\n", host,
+                    (host in b ? b[host] : "-"),
+                    (host in lf ? lf[host] : "-"),
+                    (host in r ? r[host] : "-"),
+                    (host in lasts ? lasts[host] : "-")
         }
-    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate rdate; do
-        printf '  %-20s  %-22s  %-22s\n' "${host}" "${bdate}" "${rdate}"
+    ' "${log_path}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate status; do
+        printf '  %-20s  %-22s  %-22s  %-22s  %-10s\n' "${host}" "${bdate}" "${lfdate}" "${rdate}" "${status}"
     done
 }
 
@@ -79,11 +89,50 @@ get_this_host_last_backup() {
     [[ -f "${log_path}" ]] || return 0
 
     awk -F'\t' -v host="$(hostname -s)" '
-        NF == 3 && $2 == host && $3 == "backup" {
+        NF >= 3 && $2 == host && $3 == "backup" {
             if ($1 > last) last = $1
         }
         END { if (last != "") print last }
     ' "${log_path}"
+}
+
+# Query restic for the snapshot to restore and emit pipe-separated fields:
+# short_id|iso_time|formatted_time
+# If snapshot_arg is "latest", picks the most recent --tag thunderbird-profile snapshot.
+query_snapshot_meta() {
+    local repo="$1"
+    local snapshot_arg="$2"
+    local restic_args=(snapshots --tag thunderbird-profile --json)
+    if [[ "${snapshot_arg}" == "latest" ]]; then
+        restic_args+=(--latest 1)
+    else
+        restic_args+=("${snapshot_arg}")
+    fi
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        RESTIC_REPOSITORY="${repo}" restic "${restic_args[@]}" 2>/dev/null
+    else
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic "${restic_args[@]}" 2>/dev/null
+    fi | python3 -c '
+import json, sys
+from datetime import datetime
+try:
+    snaps = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not snaps:
+    sys.exit(2)
+s = snaps[-1]
+short_id = s.get("short_id") or (s.get("id") or "")[:8]
+ts = s.get("time") or ""
+formatted = ""
+if ts:
+    raw = ts.replace("Z", "+00:00")
+    try:
+        formatted = datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        formatted = ts[:19].replace("T", " ")
+print(f"{short_id}|{ts}|{formatted}")
+'
 }
 
 usage() {
@@ -93,12 +142,12 @@ Usage: $(basename "$0") [--dry-run] [--no-merge] [--self-test] [--check] [--list
 Options:
   --dry-run    Show what would be restored without making changes
   --no-merge   Replace local folders entirely (skip message-level merge)
-  --self-test  Run a safe self-test using temporary data
+  --self-test  Run a safe self-test against a temporary restic repository
   --check      Check if a restore is needed without restoring
                Exit 0 = up to date, 1 = restore needed, 2 = unknown
-  --list       List available profile restore sources without restoring
+  --list       List available profile snapshots without restoring
   --snapshot ID
-               Restore from a profile restic snapshot instead of the latest mirror
+               Restore from a specific profile snapshot instead of the latest
   -h, --help   Show this help
 EOF
 }
@@ -131,40 +180,51 @@ while (( i < ${#args[@]} )); do
     (( i++ )) || true
 done
 
-pcloud_mount="/mnt/pcloud"
-pcloud_drive="${HOME}/pCloudDrive"
-backup_root_rel="Thunderbird Backup"
-default_profile_repo_subdir="profile-restic"
-
-have_restic_password() {
-    [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" || -f "${restic_password_file:-}" ]]
-}
-
-run_profile_restic() {
-    local repo="$1"
-    shift
-
-    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
-        RESTIC_REPOSITORY="${repo}" restic "$@"
-    else
-        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic "$@"
-    fi
-}
-default_profile_repo_subdir="profile-restic"
-
 setup_self_test() {
-    local root
     self_test_root=$(mktemp -d)
-    root="${self_test_root}"
-    trap 'rm -rf "${self_test_root}"; [[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"' EXIT
+    trap 'rm -rf "${self_test_root}"; [[ -n "${merge_work_dir:-}" ]] && rm -rf "${merge_work_dir}"; [[ -n "${snapshot_restore_dir:-}" ]] && rm -rf "${snapshot_restore_dir}"' EXIT
     tb_type="SelfTest"
     tb_version="self-test"
-    tb_dir="${root}/tb"
-    src="${root}/backup/${backup_root_rel}/thunderbird/"
-    log_file="${root}/thunderbird-restore.log"
-    LAST_RESTORE_FILE="${root}/config/tbblock/last-restore"
+    tb_dir="${self_test_root}/tb"
+    pcloud_backup_root="${self_test_root}/backup/${backup_root_rel}"
+    profile_restic_repo="${pcloud_backup_root}/${default_profile_repo_subdir}"
+    restic_password_file="${pcloud_backup_root}/.restic-password"
+    activity_log="${pcloud_backup_root}/activity.log"
+    LAST_RESTORE_FILE="${self_test_root}/config/tbblock/last-restore"
 
-    mkdir -p "${tb_dir}/restore.target"
+    mkdir -p "${tb_dir}/restore.target" "${pcloud_backup_root}"
+
+    # Build a "source" profile to back up.
+    local src_profile="${self_test_root}/source/test.profile"
+    mkdir -p "${src_profile}"
+    echo 'user_pref("mail.server.server1.hostname", "example.com");' > "${src_profile}/prefs.js"
+
+    # Build an aux dir with profile-root + metadata to back up alongside.
+    local src_aux="${self_test_root}/source/aux"
+    mkdir -p "${src_aux}/profile-root" "${src_aux}/metadata"
+    cat <<EOF > "${self_test_root}/source/profiles.ini"
+[Profile0]
+Name=SelfTest
+IsRelative=1
+Path=test.profile
+Default=1
+
+[InstallSelfTest]
+Default=test.profile
+Locked=1
+EOF
+    cp "${self_test_root}/source/profiles.ini" "${src_aux}/profile-root/profiles.ini"
+    {
+        echo "date=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "home=${self_test_root}"
+        echo "thunderbird=${tb_type}"
+        echo "thunderbird_version=${tb_version}"
+        echo "profile=SelfTest"
+        echo "profile_root=${self_test_root}/source"
+        echo "profile_path=${src_profile}"
+    } > "${src_aux}/metadata/restore-context.env"
+
+    # Target profile registry (so profile-path detection works).
     cat <<EOF > "${tb_dir}/profiles.ini"
 [Profile0]
 Name=SelfTest
@@ -177,21 +237,17 @@ Default=restore.target
 Locked=1
 EOF
 
-    mkdir -p "${src}"
-    echo 'user_pref("mail.server.server1.hostname", "example.com");' > "${src}/prefs.js"
-    cat <<EOF > "${src}/.backup_manifest"
-date=$(date '+%Y-%m-%d %H:%M:%S')
-thunderbird=${tb_type}
-thunderbird_version=${tb_version}
-profile=SelfTest
-source=${src}
-destination=${tb_dir}/restore.target/
-file_count=1
-profile_size=$(du -sh "${src}" | cut -f1)
-EOF
+    printf 'self-test-password\n' > "${restic_password_file}"
+    chmod 600 "${restic_password_file}"
+    RESTIC_REPOSITORY="${profile_restic_repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic init >/dev/null
+    RESTIC_REPOSITORY="${profile_restic_repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" \
+        restic backup --tag thunderbird --tag thunderbird-profile \
+        --tag "tb-type:${tb_type}" --tag "tb-version:${tb_version}" \
+        --host "$(hostname -s)" \
+        "${src_profile}" "${src_aux}" >/dev/null
 }
 
-# Locate backup source — check local sync first, then virtual drive
+# Resolve pCloud location (or self-test scaffolding).
 if "${self_test}"; then
     setup_self_test
 else
@@ -200,161 +256,88 @@ else
             echo "Error: ${pcloud_mount} is not readable." >&2
             exit 1
         fi
-        src="${pcloud_mount}/${backup_root_rel}/thunderbird/"
+        pcloud_backup_root="${pcloud_mount}/${backup_root_rel}"
     elif [[ -d "${pcloud_drive}" ]]; then
-        src="${pcloud_drive}/${backup_root_rel}/thunderbird/"
+        pcloud_backup_root="${pcloud_drive}/${backup_root_rel}"
     else
         echo "Error: No Thunderbird backup found in pCloud" >&2
         exit 1
     fi
+    profile_restic_repo="${pcloud_backup_root}/${default_profile_repo_subdir}"
+    restic_password_file="${pcloud_backup_root}/.restic-password"
+    activity_log="${pcloud_backup_root}/activity.log"
 fi
 
-backup_root="$(dirname "${src%/}")"
-profile_root_src="${backup_root}/profile-root"
-metadata_src="${backup_root}/metadata"
-profile_restic_repo="${backup_root}/${default_profile_repo_subdir}"
-restic_password_file="${backup_root}/.restic-password"
-
-if [[ -n "${snapshot_id}" ]]; then
-    if "${self_test}"; then
-        echo "Error: --snapshot is not supported with --self-test." >&2
-        exit 1
-    fi
-    if ! command -v restic >/dev/null 2>&1; then
-        echo "Error: restic not found." >&2
-        exit 1
-    fi
-    if [[ ! -f "${profile_restic_repo}/config" ]]; then
-        echo "Error: Profile restic repository missing: ${profile_restic_repo}" >&2
-        exit 1
-    fi
-    if ! have_restic_password; then
-        echo "Error: Restic password unavailable." >&2
-        echo "Set RESTIC_PASSWORD/RESTIC_PASSWORD_FILE or create: ${restic_password_file}" >&2
-        exit 1
-    fi
-
-    snapshot_restore_dir=$(mktemp -d)
-    echo "Extracting profile snapshot ${snapshot_id}..."
-    run_profile_restic "${profile_restic_repo}" restore "${snapshot_id}" --target "${snapshot_restore_dir}"
-
-    snapshot_src=$(find "${snapshot_restore_dir}" -type f -name prefs.js -printf '%h\n' | head -n1)
-    if [[ -z "${snapshot_src}" ]]; then
-        echo "Error: Restored snapshot does not contain a Thunderbird prefs.js file." >&2
-        exit 1
-    fi
-    src="${snapshot_src}/"
-    backup_root="${profile_restic_repo}"
-    profile_root_src=""
-    metadata_src=""
+if ! command -v restic >/dev/null 2>&1; then
+    echo "Error: restic not found." >&2
+    exit 1
+fi
+if [[ ! -f "${profile_restic_repo}/config" ]]; then
+    echo "Error: Profile restic repository missing: ${profile_restic_repo}" >&2
+    exit 1
+fi
+if ! have_restic_password; then
+    echo "Error: Restic password unavailable." >&2
+    echo "Set RESTIC_PASSWORD/RESTIC_PASSWORD_FILE or create: ${restic_password_file}" >&2
+    exit 1
 fi
 
-# ── restore source listing ───────────────────────────────────────────────────
+# ── --list ───────────────────────────────────────────────────────────────────
 if "${list}"; then
-    manifest_file="${src}/.backup_manifest"
-    manifest_date=""
-    manifest_profile=""
-    manifest_files=""
-    manifest_profile_size=""
-    manifest_tb_type=""
-    manifest_tb_version=""
-
-    if [[ -f "${manifest_file}" ]]; then
-        manifest_date=$(awk -F= '/^date=/{print $2}' "${manifest_file}")
-        manifest_profile=$(awk -F= '/^profile=/{print $2}' "${manifest_file}")
-        manifest_files=$(awk -F= '/^file_count=/{print $2}' "${manifest_file}")
-        manifest_profile_size=$(awk -F= '/^profile_size=/{print $2}' "${manifest_file}")
-        manifest_tb_type=$(awk -F= '/^thunderbird=/{print $2}' "${manifest_file}")
-        manifest_tb_version=$(awk -F= '/^thunderbird_version=/{print $2}' "${manifest_file}")
-    fi
-
     last_restore=""
-    if [[ -f "${LAST_RESTORE_FILE}" ]]; then
-        last_restore=$(cat "${LAST_RESTORE_FILE}")
-    fi
-    profile_snapshot_status=""
-    profile_snapshot_output=""
-    if [[ -f "${profile_restic_repo}/config" ]]; then
-        if ! command -v restic >/dev/null 2>&1; then
-            profile_snapshot_status="unavailable (restic not installed)"
-        elif [[ -z "${RESTIC_PASSWORD:-}" && -z "${RESTIC_PASSWORD_FILE:-}" && ! -f "${restic_password_file}" ]]; then
-            profile_snapshot_status="unavailable (password missing)"
-        else
-            set +e
-            if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
-                profile_snapshot_output=$(RESTIC_REPOSITORY="${profile_restic_repo}" restic snapshots --tag thunderbird-profile --compact 2>&1)
-            else
-                profile_snapshot_output=$(RESTIC_REPOSITORY="${profile_restic_repo}" RESTIC_PASSWORD_FILE="${restic_password_file}" restic snapshots --tag thunderbird-profile --compact 2>&1)
-            fi
-            snapshot_status=$?
-            set -e
-            if [[ "${snapshot_status}" -eq 0 ]]; then
-                profile_snapshot_status="available"
-            else
-                profile_snapshot_status="unavailable (${profile_snapshot_output})"
-                profile_snapshot_output=""
-            fi
-        fi
-    else
-        profile_snapshot_status="not configured"
-    fi
-
+    [[ -f "${LAST_RESTORE_FILE}" ]] && last_restore=$(cat "${LAST_RESTORE_FILE}")
     cat <<EOF
 ==============================
   Restore Sources
 ==============================
-  Mode:               latest profile mirror; profile snapshots listed when configured
-  Source:             ${src}
-  Backup root:        ${backup_root}
-  Backup date:        ${manifest_date:-(unknown)}
-  Thunderbird:        ${manifest_tb_type:-(unknown)} ${manifest_tb_version:-(unknown)}
-  Profile:            ${manifest_profile:-(unknown)}
-  Files:              ${manifest_files:-(unknown)}
-  Profile size:       ${manifest_profile_size:-(unknown)}
+  Repository:         ${profile_restic_repo}
   Last local restore: ${last_restore:-(never)}
-  Profile registry:   $([[ -f "${profile_root_src}/profiles.ini" ]] && echo "${profile_root_src}/profiles.ini" || echo "(missing)")
-  Install registry:   $([[ -f "${profile_root_src}/installs.ini" ]] && echo "${profile_root_src}/installs.ini" || echo "(missing)")
-  Metadata:           $([[ -d "${metadata_src}" ]] && echo "${metadata_src}" || echo "(missing)")
-  Profile snapshots:  ${profile_snapshot_status}
+  Use --snapshot ID to restore a specific snapshot below.
 ==============================
-  Use --snapshot ID to restore from a listed profile snapshot.
-==============================
+
+Profile Snapshot History
 EOF
-    if [[ -n "${profile_snapshot_output}" ]]; then
-        echo
-        echo "Profile Snapshot History"
-        printf '%s\n' "${profile_snapshot_output}"
-    fi
+    run_profile_restic "${profile_restic_repo}" snapshots --tag thunderbird-profile --compact
     exit 0
 fi
 
-# ── upgrade check ─────────────────────────────────────────────────────────────
-if "${check}"; then
-    manifest_file="${src}/.backup_manifest"
-    if [[ -f "${manifest_file}" ]]; then
-        manifest_date=$(awk -F= '/^date=/{print $2}' "${manifest_file}")
-    fi
-    last_restore=""
-    if [[ -f "${LAST_RESTORE_FILE}" ]]; then
-        last_restore=$(cat "${LAST_RESTORE_FILE}")
-    fi
-    this_host_last_backup=$(get_this_host_last_backup "${backup_root}/activity.log")
+# Resolve target snapshot metadata.
+snapshot_arg="${snapshot_id:-latest}"
+set +e
+snapshot_meta=$(query_snapshot_meta "${profile_restic_repo}" "${snapshot_arg}")
+meta_status=$?
+set -e
+if [[ "${meta_status}" -ne 0 || -z "${snapshot_meta}" ]]; then
+    echo "Error: No matching profile snapshot found in ${profile_restic_repo}" >&2
+    [[ "${snapshot_arg}" != "latest" ]] && echo "       (looking for: ${snapshot_arg})" >&2
+    exit 1
+fi
+snapshot_short_id="${snapshot_meta%%|*}"
+remaining="${snapshot_meta#*|}"
+snapshot_iso="${remaining%%|*}"
+snapshot_when="${remaining#*|}"
 
-    printf 'Backup date:   %s\n' "${manifest_date:-(unknown)}"
+# ── --check ──────────────────────────────────────────────────────────────────
+if "${check}"; then
+    last_restore=""
+    [[ -f "${LAST_RESTORE_FILE}" ]] && last_restore=$(cat "${LAST_RESTORE_FILE}")
+    this_host_last_backup=$(get_this_host_last_backup "${activity_log}")
+
+    printf 'Snapshot:      %s (%s)\n' "${snapshot_short_id}" "${snapshot_when}"
     printf 'Last restore:  %s\n' "${last_restore:-(never)}"
     echo "NOTE: verify pCloud has finished syncing on this machine before restoring."
 
-    if [[ -z "${manifest_date}" ]]; then
-        echo "Status:        Unknown (backup manifest not found)"
+    if [[ -z "${snapshot_when}" ]]; then
+        echo "Status:        Unknown (no snapshot data)"
         exit 2
-    elif [[ -n "${this_host_last_backup}" && ! "${this_host_last_backup}" < "${manifest_date}" ]]; then
-        echo "Status:        Up to date (this machine created the current backup)"
+    elif [[ -n "${this_host_last_backup}" && ! "${this_host_last_backup}" < "${snapshot_when}" ]]; then
+        echo "Status:        Up to date (this machine created the current snapshot)"
         exit 0
     elif [[ -z "${last_restore}" ]]; then
         echo "Status:        Restore needed (never restored on this machine)"
         exit 1
-    elif [[ "${last_restore}" < "${manifest_date}" ]]; then
-        echo "Status:        Restore needed (backup is newer than last restore)"
+    elif [[ "${last_restore}" < "${snapshot_when}" ]]; then
+        echo "Status:        Restore needed (snapshot is newer than last restore)"
         exit 1
     else
         echo "Status:        Up to date"
@@ -362,6 +345,7 @@ if "${check}"; then
     fi
 fi
 
+# ── Thunderbird detection ────────────────────────────────────────────────────
 run_quick_check() {
     if command -v timeout >/dev/null 2>&1; then
         timeout 5s "$@" >/dev/null 2>&1
@@ -381,7 +365,7 @@ find_flatpak_thunderbird() {
     return 1
 }
 
-# Detect Thunderbird installation and set profile directory accordingly
+TB_FLATPAK_APP_ID=""
 if ! "${self_test}"; then
     if TB_FLATPAK_APP_ID=$(find_flatpak_thunderbird); then
         tb_type="Flatpak"
@@ -429,14 +413,12 @@ if ! "${self_test}"; then
 fi
 
 profiles_ini="${tb_dir}/profiles.ini"
-
 if [[ ! -f "${profiles_ini}" ]]; then
     echo "Error: ${profiles_ini} not found" >&2
     echo "Please launch Thunderbird once to create a default profile, then re-run this script." >&2
     exit 1
 fi
 
-# Determine active profile path.
 profile_path=$(python3 "${SCRIPT_DIR}/thunderbird_profile.py" "${tb_dir}") || {
     echo "Error: Could not determine active Thunderbird profile from ${tb_dir}/profiles.ini" >&2
     exit 1
@@ -468,6 +450,7 @@ if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
     read -rp "Kill Thunderbird before restoring? [y/N] " confirm_kill
     if [[ "${confirm_kill}" != [yY] ]]; then
         echo "Error: Please close Thunderbird before restoring." >&2
+        log_activity "restore" "cancelled" "thunderbird-running" "${activity_log}"
         exit 1
     fi
     pkill -x thunderbird 2>/dev/null || true
@@ -477,118 +460,119 @@ if ! "${self_test}" && ! "${dry_run}" && check_thunderbird_running; then
     sleep 2
     if check_thunderbird_running; then
         echo "Error: Thunderbird is still running. Please close it manually and retry." >&2
+        log_activity "restore" "error" "thunderbird-still-running" "${activity_log}"
         exit 1
     fi
 fi
 
-# Peek at backup and last-restore dates for display before confirmation.
-_peek_backup_date=""
-if [[ -f "${src}/.backup_manifest" ]]; then
-    _peek_backup_date=$(awk -F= '/^date=/{print $2}' "${src}/.backup_manifest")
-fi
+# Show restore plan and confirm.
 _peek_last_restore=""
-if [[ -f "${LAST_RESTORE_FILE}" ]]; then
-    _peek_last_restore=$(cat "${LAST_RESTORE_FILE}")
-fi
+[[ -f "${LAST_RESTORE_FILE}" ]] && _peek_last_restore=$(cat "${LAST_RESTORE_FILE}")
 
-# Show restore plan and confirm
-echo "Thunderbird: ${tb_type}"
-echo "Version: ${tb_version}"
+echo "Thunderbird:    ${tb_type}"
+echo "Version:        ${tb_version}"
 echo "Active profile: ${active_profile}"
-echo "Backup date:    ${_peek_backup_date:-(unknown)}"
+echo "Snapshot:       ${snapshot_short_id} (${snapshot_when})"
 echo "Last restore:   ${_peek_last_restore:-(never)}"
 echo "NOTE: pCloud sync must be complete on this machine before restoring."
 if "${dry_run}"; then
-    echo "Dry run: ${src} -> ${dest}"
+    echo "Dry run: would extract snapshot ${snapshot_short_id} and restore into ${dest}"
 else
-    echo "Restoring from ${src} to ${dest}"
+    echo "Restoring snapshot ${snapshot_short_id} into ${dest}"
 fi
 echo
+
 if ! "${dry_run}" && ! "${self_test}"; then
     read -rp "This will overwrite the current profile. Continue? [y/N] " confirm
     if [[ "${confirm}" != [yY] ]]; then
         echo "Restore cancelled."
+        log_activity "restore" "cancelled" "user-declined" "${activity_log}"
         exit 0
     fi
 fi
 
-if [[ ! -f "${src}/prefs.js" ]]; then
-    echo "Error: Source does not look like a Thunderbird profile: ${src}" >&2
-    exit 1
+# ── Extract snapshot ─────────────────────────────────────────────────────────
+if "${self_test}"; then
+    extract_parent="${self_test_root}/extract"
+else
+    extract_parent="${HOME}/.cache/thunderbird-restore"
+fi
+mkdir -p "${extract_parent}"
+snapshot_restore_dir=$(mktemp -d --tmpdir="${extract_parent}" snapshot.XXXXXXXXXX)
+echo "Extracting snapshot ${snapshot_short_id} into ${snapshot_restore_dir}..."
+set +e
+run_profile_restic "${profile_restic_repo}" restore "${snapshot_short_id}" --target "${snapshot_restore_dir}" >/dev/null
+restore_status=$?
+set -e
+if [[ "${restore_status}" -ne 0 ]]; then
+    echo "Error: restic restore failed (exit ${restore_status})." >&2
+    log_activity "restore" "error" "restic-exit-${restore_status}" "${activity_log}"
+    exit "${restore_status}"
 fi
 
-manifest_file="${src}/.backup_manifest"
-manifest_profile=""
-if [[ ! -f "${manifest_file}" ]]; then
-    if ! "${dry_run}" && ! "${self_test}"; then
-        echo "Warning: Backup manifest not found: ${manifest_file}" >&2
-        read -rp "Continue anyway? [y/N] " confirm_manifest
-        if [[ "${confirm_manifest}" != [yY] ]]; then
-            echo "Restore cancelled."
-            exit 0
-        fi
+# Locate profile body, aux profile-root, and aux metadata inside the extract.
+src=$(find "${snapshot_restore_dir}" -type f -name prefs.js -printf '%h\n' | head -n1)
+if [[ -z "${src}" ]]; then
+    echo "Error: Restored snapshot does not contain a Thunderbird prefs.js file." >&2
+    log_activity "restore" "error" "no-prefs-js" "${activity_log}"
+    exit 1
+fi
+src="${src}/"
+
+aux_root=$(find "${snapshot_restore_dir}" -type d -path '*/thunderbird-backup/aux' | head -n1)
+profile_root_src=""
+metadata_src=""
+if [[ -n "${aux_root}" ]]; then
+    [[ -d "${aux_root}/profile-root" ]] && profile_root_src="${aux_root}/profile-root"
+    [[ -d "${aux_root}/metadata" ]]     && metadata_src="${aux_root}/metadata"
+fi
+
+# Version-mismatch check from the embedded restore-context.env.
+if [[ -n "${metadata_src}" && -f "${metadata_src}/restore-context.env" ]]; then
+    snapshot_tb_type=$(awk -F= '/^thunderbird=/{print $2}' "${metadata_src}/restore-context.env")
+    snapshot_tb_version=$(awk -F= '/^thunderbird_version=/{print $2}' "${metadata_src}/restore-context.env")
+    snapshot_profile=$(awk -F= '/^profile=/{print $2}' "${metadata_src}/restore-context.env")
+    if [[ -n "${snapshot_tb_type}" && "${snapshot_tb_type}" != "${tb_type}" ]]; then
+        echo "Warning: Snapshot was created from ${snapshot_tb_type}, restore target is ${tb_type}."
     fi
-else
-    manifest_file_count=$(awk -F= '/^file_count=/{print $2}' "${manifest_file}")
-    if [[ -z "${manifest_file_count}" || "${manifest_file_count}" -le 0 ]]; then
-        echo "Error: Backup manifest appears invalid: ${manifest_file}" >&2
-        exit 1
-    fi
-    manifest_date=$(awk -F= '/^date=/{print $2}' "${manifest_file}")
-    manifest_tb_type=$(awk -F= '/^thunderbird=/{print $2}' "${manifest_file}")
-    manifest_tb_version=$(awk -F= '/^thunderbird_version=/{print $2}' "${manifest_file}")
-    manifest_profile=$(awk -F= '/^profile=/{print $2}' "${manifest_file}")
-    if [[ -n "${manifest_tb_type}" && "${manifest_tb_type}" != "${tb_type}" ]]; then
-        echo "Warning: Backup was created from ${manifest_tb_type}, restore target is ${tb_type}."
-    fi
-    if [[ -n "${manifest_tb_version}" && "${manifest_tb_version}" != "unknown" && "${tb_version}" != "unknown" && "${manifest_tb_version}" != "${tb_version}" ]]; then
-        echo "Warning: Backup Thunderbird version (${manifest_tb_version}) differs from target (${tb_version})."
-        backup_major=$(get_major_version "${manifest_tb_version}")
+    if [[ -n "${snapshot_tb_version}" && "${snapshot_tb_version}" != "unknown" && "${tb_version}" != "unknown" && "${snapshot_tb_version}" != "${tb_version}" ]]; then
+        echo "Warning: Snapshot Thunderbird version (${snapshot_tb_version}) differs from target (${tb_version})."
+        backup_major=$(get_major_version "${snapshot_tb_version}")
         target_major=$(get_major_version "${tb_version}")
         if [[ -n "${backup_major}" && -n "${target_major}" && "${target_major}" -lt "${backup_major}" ]]; then
-            echo "Warning: Target appears older than backup source. This can cause startup/profile errors."
+            echo "Warning: Target appears older than snapshot source. This can cause startup/profile errors."
         fi
         if ! "${dry_run}" && ! "${self_test}"; then
             read -rp "Continue with version mismatch? [y/N] " confirm_version_mismatch
             if [[ "${confirm_version_mismatch}" != [yY] ]]; then
                 echo "Restore cancelled."
+                log_activity "restore" "cancelled" "version-mismatch" "${activity_log}"
                 exit 0
             fi
         fi
     fi
-fi
-
-if [[ -d "${profile_root_src}" ]]; then
-    if [[ -f "${profile_root_src}/profiles.ini" ]]; then
-        echo "Backup includes profile registry: ${profile_root_src}/profiles.ini"
+    if [[ -n "${snapshot_profile}" && -n "${active_profile}" && "${snapshot_profile}" != "${active_profile}" ]]; then
+        echo "Note: Snapshot profile name (${snapshot_profile}) differs from target active profile (${active_profile})."
+        echo "      This restore will copy profile contents into the target active profile."
     fi
-    if [[ -f "${profile_root_src}/installs.ini" ]]; then
-        echo "Backup includes install registry: ${profile_root_src}/installs.ini"
-    fi
-fi
-if [[ -d "${metadata_src}" ]]; then
-    echo "Backup includes install metadata: ${metadata_src}"
-fi
-if [[ -n "${manifest_profile}" && -n "${active_profile}" && "${manifest_profile}" != "${active_profile}" ]]; then
-    echo "Note: Backup profile name (${manifest_profile}) differs from target active profile (${active_profile})."
-    echo "      This restore will copy profile contents into the target active profile."
 fi
 
 resolved_dest=$(readlink -f "${dest}")
 resolved_tb_dir=$(readlink -f "${tb_dir}")
 if [[ "${resolved_dest}" != "${resolved_tb_dir}"/* ]]; then
     echo "Error: Refusing to restore outside Thunderbird profile directory: ${dest}" >&2
+    log_activity "restore" "error" "dest-outside-profile" "${activity_log}"
     exit 1
 fi
 
-# ── Install native messaging host (Flatpak only) ──────────────────────────────
+# ── Install native messaging host (Flatpak only) ─────────────────────────────
 if ! "${dry_run}" && ! "${self_test}" && [[ "${tb_type}" == "Flatpak" ]]; then
     echo "Installing native messaging host..."
     "${SCRIPT_DIR}/install-native-host" 2>&1 || true
     echo
 fi
 
-# ── Local folder merge: snapshot pre-restore messages ─────────────────────
+# ── Local folder merge: snapshot pre-restore messages ────────────────────────
 if ! "${no_merge}" && ! "${dry_run}" && ! "${self_test}"; then
     src_local="${src%/}/Mail/Local Folders"
     dest_local="${dest%/}/Mail/Local Folders"
@@ -604,6 +588,7 @@ elif "${no_merge}"; then
     merge_status="Skipped (--no-merge)"
 fi
 
+# ── rsync extracted profile into active profile ──────────────────────────────
 echo
 start_time=$(date +%s)
 tmp_dry_dest=""
@@ -615,12 +600,13 @@ else
     mkdir -p "${dest}"
 fi
 
+rsync_common=(rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --delete --stats)
 if "${dry_run}"; then
-    rsync_output=$(run_rsync_capture rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats --dry-run "${src}" "${rsync_dest}")
+    rsync_output=$("${rsync_common[@]}" --dry-run "${src}" "${rsync_dest}" 2>&1)
 else
-    rsync_output=$(run_rsync_capture rsync -a --copy-links --exclude='lock' --exclude='.parentlock' --exclude='.backup_manifest' --delete --stats "${src}" "${dest}")
+    rsync_output=$("${rsync_common[@]}" "${src}" "${dest}" 2>&1)
 
-    # ── Local folder merge: re-add preserved messages ─────────────────────
+    # ── Local folder merge: re-add preserved messages ──────────────────────
     if [[ -n "${merge_work_dir}" ]]; then
         dest_local="${dest%/}/Mail/Local Folders"
         echo "Merging preserved messages..."
@@ -636,20 +622,16 @@ else
 
     reset_profile_runtime_state "${dest%/}"
 
-    # Record restore timestamp for upgrade check
-    if [[ -n "${manifest_date}" ]]; then
-        mkdir -p "$(dirname "${LAST_RESTORE_FILE}")"
-        printf '%s\n' "${manifest_date}" > "${LAST_RESTORE_FILE}"
-    fi
+    mkdir -p "$(dirname "${LAST_RESTORE_FILE}")"
+    printf '%s\n' "${snapshot_when}" > "${LAST_RESTORE_FILE}"
     if ! "${self_test}"; then
-        log_activity "restore" "${backup_root}/activity.log"
+        log_activity "restore" "ok" "${snapshot_when}" "${activity_log}"
     fi
 fi
 [[ -n "${tmp_dry_dest}" ]] && rm -rf "${tmp_dry_dest}"
 end_time=$(date +%s)
 elapsed=$(( end_time - start_time ))
 
-# Format duration
 if (( elapsed >= 3600 )); then
     duration="$(( elapsed / 3600 ))h $(( (elapsed % 3600) / 60 ))m $(( elapsed % 60 ))s"
 elif (( elapsed >= 60 )); then
@@ -658,22 +640,20 @@ else
     duration="${elapsed}s"
 fi
 
-# Parse rsync stats
 files_transferred=$(echo "${rsync_output}" | awk '/Number of regular files transferred:/{print $NF}')
-total_size=$(echo "${rsync_output}" | awk '/Total file size:/{print $4, $5}')
 sent=$(echo "${rsync_output}" | awk '/Total bytes sent:/{if ($5!="") print $4" "$5; else print $4}')
-profile_size=$(du -sh "${src}" | cut -f1)
+profile_size=$(du -sh "${src}" 2>/dev/null | cut -f1 || echo "?")
 if "${dry_run}"; then
     restored_size="n/a"
     file_count="n/a"
 else
-    restored_size=$(du -sh "${dest}" | cut -f1)
-    file_count=$(find "${dest}" -type f | wc -l)
+    restored_size=$(du -sh "${dest}" 2>/dev/null | cut -f1 || echo "?")
+    file_count=$(find "${dest}" -type f 2>/dev/null | wc -l)
 fi
 
-# Apply MIME type defaults from backup metadata
+# ── Apply MIME defaults ──────────────────────────────────────────────────────
 mime_status=""
-if ! "${dry_run}" && ! "${self_test}" && [[ -f "${metadata_src}/xdg-mime-defaults.txt" ]] && command -v xdg-mime &>/dev/null; then
+if ! "${dry_run}" && ! "${self_test}" && [[ -n "${metadata_src}" && -f "${metadata_src}/xdg-mime-defaults.txt" ]] && command -v xdg-mime &>/dev/null; then
     mime_applied=0
     mime_failed=0
     while IFS='=' read -r mime_type desktop_file; do
@@ -695,12 +675,9 @@ else
     mime_status="Skipped"
 fi
 
-# Apply Flatpak sandbox restrictions from backup metadata
+# ── Apply Flatpak sandbox restrictions ───────────────────────────────────────
 flatpak_status=""
-if ! "${dry_run}" && ! "${self_test}" && [[ "${tb_type}" == "Flatpak" ]] && [[ -f "${metadata_src}/flatpak-override-user.txt" ]]; then
-    # Extract only '!home' and similar negation/restriction entries — skip
-    # source-system-specific path grants (absolute paths starting with /).
-    # The !home entry tightens the sandbox and should be carried over.
+if ! "${dry_run}" && ! "${self_test}" && [[ "${tb_type}" == "Flatpak" ]] && [[ -n "${metadata_src}" && -f "${metadata_src}/flatpak-override-user.txt" ]]; then
     restrictions=$(grep -oP '(?<=filesystems=)[^;]+(?:;[^;]+)*' "${metadata_src}/flatpak-override-user.txt" 2>/dev/null \
         | tr ';' '\n' | grep -v '^/' | grep -v '^$' || true)
     if [[ -n "${restrictions}" ]]; then
@@ -717,20 +694,22 @@ else
     flatpak_status="Skipped"
 fi
 
-# Restore native messaging hosts
+# ── Restore native messaging hosts ───────────────────────────────────────────
 nm_host_status=""
-nm_host_src="${metadata_src}/native-messaging-hosts"
-if ! "${dry_run}" && ! "${self_test}" && [[ -d "${nm_host_src}" ]]; then
+if [[ -n "${metadata_src}" ]]; then
+    nm_host_src="${metadata_src}/native-messaging-hosts"
+else
+    nm_host_src=""
+fi
+if ! "${dry_run}" && ! "${self_test}" && [[ -n "${nm_host_src}" && -d "${nm_host_src}" ]]; then
     if [[ "${tb_type}" == "Flatpak" ]]; then
         nm_host_dest="${HOME}/.mozilla/native-messaging-hosts"
         mkdir -p "${nm_host_dest}"
         cp -a "${nm_host_src}/." "${nm_host_dest}/"
         nm_count=$(find "${nm_host_src}" -maxdepth 1 -name "*.json" | wc -l)
         nm_host_status="Restored ${nm_count} manifest(s) to ${nm_host_dest}"
-        # Grant sandbox read access to the manifest directory (overrides !home).
         flatpak override --user "${TB_FLATPAK_APP_ID}" \
             --filesystem="${nm_host_dest}:ro" 2>/dev/null || true
-        # Grant sandbox access to each host script directory that exists.
         while IFS= read -r manifest_path; do
             host_script=$(python3 -c "
 import json,sys
@@ -753,7 +732,6 @@ else
     nm_host_status="Skipped"
 fi
 
-# Build post-restore checklist
 post_restore_notes=""
 if ! "${dry_run}" && ! "${self_test}"; then
     post_restore_notes=$(cat <<'NOTES'
@@ -766,8 +744,8 @@ NOTES
 )
 fi
 
-# Report
-report=$(cat <<EOF
+cat <<EOF
+
 ==============================
   Restore Report
 ==============================
@@ -775,14 +753,14 @@ report=$(cat <<EOF
   Thunderbird:        ${tb_type}
   Version:            ${tb_version}
   Profile:            ${active_profile}
-  Source:             ${src}
+  Snapshot:           ${snapshot_short_id} (${snapshot_when})
   Destination:        ${dest}
   Duration:           ${duration}
   Files transferred:  ${files_transferred}
   Data transferred:   ${sent}
   Total files:        ${file_count}
   Restored size:      ${restored_size}
-  Profile size:       ${profile_size}
+  Snapshot size:      ${profile_size}
   Local folder merge: ${merge_status}
   MIME defaults:      ${mime_status}
   Flatpak sandbox:    ${flatpak_status}
@@ -791,16 +769,11 @@ report=$(cat <<EOF
   Restore $("${dry_run}" && echo "(dry run) ")complete.
 ==============================
 EOF
-)
 
-echo "${report}"
-if ! "${dry_run}"; then
-    echo "${report}" >> "${log_file}"
-fi
 if ! "${dry_run}" && ! "${self_test}"; then
     echo
     echo "  Computer Activity"
-    format_activity_table "${backup_root}/activity.log"
+    format_activity_table "${activity_log}"
 fi
 if [[ -n "${post_restore_notes}" ]]; then
     echo "${post_restore_notes}"

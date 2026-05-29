@@ -4,7 +4,7 @@
 
 One machine is the **review system**. Its Thunderbird catches all unrecognised mail in `Local Folders/Review` and its filter catch-all is enabled. Every other machine has the catch-all disabled so mail is not intercepted before the review system sees it.
 
-Filter rules and address books live in the Thunderbird profile. The profile is backed up to pCloud (`Thunderbird Backup/`) and restored onto each machine. Domain block/route changes are queued in `blocked_domains.txt` (pCloud-synced) so any machine can queue a change, but `tbblock-rebuild` applies queued changes to local filter files and must be run per-machine.
+Filter rules and address books live in the Thunderbird profile. The review system publishes the shared profile to pCloud (`Thunderbird Backup/profile-restic/`) as a restic snapshot repository — each backup is a new snapshot, and any snapshot can be restored on any machine. Non-review machines use the same `thunderbird-backup` command, but it skips publishing the shared profile and runs the Local Folders backup only. Domain block/route changes are queued in `blocked_domains.txt` (pCloud-synced) so any machine can queue a change, but `tbblock-rebuild` applies queued changes to local filter files and must be run per-machine.
 
 ---
 
@@ -86,18 +86,20 @@ Run this after applying changes on the review system, after address book changes
 
 ```bash
 thunderbird-backup
+thunderbird-localfolders-backup
 ```
 
 **On each other machine:**
 
 ```bash
+thunderbird-backup                 # local folders backup only on non-review machines
 thunderbird-restore --check        # confirm restore is needed first
 # Close Thunderbird first, then:
 thunderbird-restore
 # tbblock-rebuild runs automatically at the end of thunderbird-restore
 ```
 
-`thunderbird-restore` uses rsync with `--delete`, so the restored profile exactly matches the backup. Any new local folders created on the review system will appear on restored machines. A merge step preserves messages that exist locally but are absent from the backup, so no local messages are lost.
+`thunderbird-restore` restores the shared profile onto each machine. The default restores the latest profile snapshot from the restic repository; `thunderbird-restore --snapshot <id>` restores a specific snapshot instead. A merge step preserves messages that exist locally but are absent from the backup, so no local messages are lost.
 
 The merge step can occasionally introduce duplicate messages in local folders. If duplicates appear after a restore, run:
 
@@ -144,6 +146,13 @@ thunderbird-restore --check || thunderbird-restore
 
 The check only requires pCloud to be mounted — it does not inspect the local Thunderbird profile.
 
+To inspect available restore targets:
+
+```bash
+thunderbird-restore --list
+thunderbird-restore --snapshot <snapshot-id>
+```
+
 ---
 
 ## Re-running install after updates
@@ -152,6 +161,7 @@ The repo syncs to all machines automatically via pCloud, but `~/bin` symlinks an
 
 - New scripts are added to the toolset (new symlinks needed)
 - Systemd unit files are changed (timers need reloading)
+- pCloud drops execute bits from one or more scripts
 
 ```bash
 chmod +x install && ./install
@@ -165,20 +175,27 @@ The `chmod +x` is required because the pCloud filesystem does not preserve execu
 
 1. Install Thunderbird and launch it once to create a profile.
 2. Close Thunderbird.
-3. Run `thunderbird-restore` to load the current profile.
-4. Run the install script to create `~/bin` symlinks and enable backup timers:
+3. Run the install script to create `~/bin` symlinks and enable backup timers:
    ```bash
    chmod +x install && ./install
    ```
    The `chmod +x` is needed because the pCloud filesystem does not preserve
    execute bits across syncs.
-5. Mark the machine as non-review (skip if this will be the review system):
+4. Mark the machine as non-review if this will not be the review system:
    ```bash
    mkdir -p ~/.config/tbblock && touch ~/.config/tbblock/no-review
    ```
-6. `thunderbird-restore` runs `tbblock-rebuild` and (for Flatpak) `install-native-host`
+5. Restore the current profile:
+   ```bash
+   thunderbird-restore
+   ```
+   Use `thunderbird-restore --list` and `thunderbird-restore --snapshot <id>` if you want a specific profile snapshot instead of the latest.
+6. On non-review machines, `thunderbird-backup` only runs the Local Folders backup. On the review system, `thunderbird-backup` creates a new profile restic snapshot. Run `thunderbird-localfolders-backup` on the review system if you want the review machine's Local Folders snapshot too.
+
+   **Prerequisite:** the restic password file `~/pcloud/Thunderbird Backup/.restic-password` (or `RESTIC_PASSWORD` / `RESTIC_PASSWORD_FILE`) must be readable before the first restore. Without it, this machine cannot extract any profile snapshot.
+7. `thunderbird-restore` runs `tbblock-rebuild` and (for Flatpak) `install-native-host`
    automatically — no manual run needed.
-7. On the review system, install the review actions extension permanently:
+8. On the review system, install the review actions extension permanently:
    ```bash
    install-review-actions
    ```
@@ -192,10 +209,9 @@ The `chmod +x` is required because the pCloud filesystem does not preserve execu
 ### On the old review system
 
 ```bash
+tbblock-rebuild                    # disable catch-all before demotion
+thunderbird-backup                 # capture the final shared profile state
 mkdir -p ~/.config/tbblock && touch ~/.config/tbblock/no-review
-# Close Thunderbird, then:
-tbblock-rebuild                    # disables catch-all
-thunderbird-backup                 # capture current state
 ```
 
 ### On the new review system
@@ -204,6 +220,8 @@ thunderbird-backup                 # capture current state
 rm -f ~/.config/tbblock/no-review
 thunderbird-restore                # restore current profile
 # tbblock-rebuild runs automatically and enables the catch-all
+thunderbird-backup                 # publish the shared profile from the new review system
+thunderbird-localfolders-backup    # capture the review machine's Local Folders snapshot
 ```
 
 ### On all other machines
@@ -211,6 +229,7 @@ thunderbird-restore                # restore current profile
 ```bash
 thunderbird-restore
 # tbblock-rebuild runs automatically and re-disables the catch-all
+thunderbird-backup                 # local folders backup only
 ```
 
 ---
@@ -236,26 +255,33 @@ On a **non-review machine** the extension has no Review folder to process. The o
 
 ---
 
-## Historical snapshot backup (restic)
+## Restic repositories
 
-`thunderbird-localfolders-backup` keeps dated snapshots of `Mail/Local Folders` so individual deleted messages can be recovered even after a profile restore cycle has overwritten them. The `install` script enables timers on every machine (daily backup at 9am, monthly prune on the 1st), so each machine independently contributes its Local Folders state to the shared pCloud restic repository. Snapshots are tagged by hostname.
+The review system maintains profile snapshots with `thunderbird-backup` in `Thunderbird Backup/profile-restic/`. Every machine maintains Local Folders snapshots with `thunderbird-localfolders-backup` in `Thunderbird Backup/localfolders-restic/`. Both repos use the shared password file `Thunderbird Backup/.restic-password`.
 
 **First-time setup (once, on one machine):**
 
 ```bash
-openssl rand -base64 32 > ~/pcloud/"Thunderbird Backup"/.restic-password
 chmod 600 ~/pcloud/"Thunderbird Backup"/.restic-password
+thunderbird-backup init-profile-repo
 thunderbird-localfolders-backup init
 ```
 
-**Check timer status:**
+**List profile snapshots:**
 
 ```bash
-systemctl --user list-timers tb-localfolders-backup.timer tb-localfolders-prune.timer
-journalctl --user -u tb-localfolders-backup
+thunderbird-backup profile-snapshots
+# or:
+thunderbird-restore --list
 ```
 
-**Restore a specific file from a snapshot:**
+**List Local Folders snapshots:**
+
+```bash
+thunderbird-localfolders-backup snapshots
+```
+
+**Restore a specific file from a Local Folders snapshot:**
 
 ```bash
 restic -r ~/pcloud/"Thunderbird Backup"/localfolders-restic snapshots
@@ -263,13 +289,25 @@ restic -r ~/pcloud/"Thunderbird Backup"/localfolders-restic restore <snapshot-id
   --include "Inbox" --target /tmp/tb-restore
 ```
 
+**Restore a specific profile snapshot:**
+
+```bash
+thunderbird-restore --snapshot <snapshot-id>
+```
+
+The `install` script enables timers on every machine (daily Local Folders backup at 9am, monthly prune on the 1st), so each machine independently contributes its Local Folders state to the shared pCloud restic repository. Snapshots are tagged by hostname. Profile snapshots are created on-demand by running `thunderbird-backup` on the review system.
+
 ---
 
 ## Audit and diagnostics
 
 ```bash
 thunderbird-report                 # full status: backup, restore, role, and computer activity
+thunderbird-doctor                 # backup health, repos, timers, password, install links
 thunderbird-restore --check        # quick check: is this machine's restore up to date?
+thunderbird-restore --list         # list available profile snapshots in the restic repo
+thunderbird-backup profile-snapshots
+thunderbird-localfolders-backup snapshots
 thunderbird-audit                  # inspect profiles, detect orphans
 thunderbird-audit --fix            # interactive cleanup (use with care)
 tbblock-rebuild --list             # show role, catch-all state, blocked domains, routes
@@ -277,7 +315,7 @@ tbq-filter-audit --account bluerug --search paypal --why
 tbq-filter-audit --search reverb --limit 5
 ```
 
-Each successful backup and restore appends a record to `Thunderbird Backup/activity.log` on pCloud. The backup and restore reports include a **Computer Activity** table showing the most recent backup and restore date for every machine that has used these tools.
+Every backup and restore — including cancellations and errors — appends a five-column row to `Thunderbird Backup/activity.log` on pCloud (date, host, action, status, detail). `thunderbird-report` is the single central view: it reads the activity log plus the restic snapshot history to render a **Computer Activity** table showing each machine's most recent backup, LF backup, restore, and status.
 
 ---
 
@@ -287,10 +325,9 @@ The backup is stored under `Thunderbird Backup/` on pCloud:
 
 | Path | Contents |
 |------|----------|
-| `thunderbird/` | Active profile contents (filters, address books, local folders) |
-| `profile-root/` | `profiles.ini` and `installs.ini` |
-| `metadata/` | Flatpak overrides, portal grants, MIME handler defaults |
-| `localfolders-restic/` | Restic repository for historical Local Folders snapshots |
-| `activity.log` | Tab-separated record of backup and restore events by machine |
+| `profile-restic/` | Restic repository: profile body + `profiles.ini`/`installs.ini` + Flatpak/MIME/native-messaging metadata, snapshotted by the review system |
+| `localfolders-restic/` | Restic repository: per-machine `Mail/Local Folders` snapshots, tagged by hostname |
+| `.restic-password` | Shared restic password file (chmod 600) |
+| `activity.log` | Five-column TSV: date, host, action, status, detail. Cross-machine log of every backup, LF backup, and restore — including cancellations and errors. |
 
-`thunderbird-backup` writes first to a local staging directory (`~/.local/share/thunderbird-backup/`), then pushes the completed snapshot to pCloud with a single rsync pass. This prevents pCloud from racing to upload partially-written files. The local copy is immediately available for restore without waiting for pCloud sync.
+On the review system, `thunderbird-backup` creates one restic snapshot containing both the active profile and an auxiliary tree (profile-root + metadata) staged under `~/.local/share/thunderbird-backup/aux/`. Non-review machines skip the profile snapshot and run the Local Folders backup only. `thunderbird-restore` extracts the latest profile snapshot by default; `--snapshot <id>` selects a specific one.

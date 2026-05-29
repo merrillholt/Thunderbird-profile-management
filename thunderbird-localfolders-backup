@@ -199,5 +199,5 @@ backup_args=(
 restic "${backup_args[@]}"
 
 if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
-    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "localfolders-backup" >> "${backup_root}/activity.log"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "localfolders-backup" "ok" "" >> "${backup_root}/activity.log"
 fi

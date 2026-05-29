@@ -70,22 +70,28 @@ format_activity_table() {
         return
     fi
 
-    printf '  %-20s  %-22s  %-22s  %-22s\n' "Computer" "Last Backup" "Last LF Backup" "Last Restore"
-    printf '  %-20s  %-22s  %-22s  %-22s\n' "--------------------" "----------------------" "----------------------" "----------------------"
+    printf '  %-20s  %-22s  %-22s  %-22s  %-10s\n' "Computer" "Last Backup" "Last LF Backup" "Last Restore" "Status"
+    printf '  %-20s  %-22s  %-22s  %-22s  %-10s\n' "--------------------" "----------------------" "----------------------" "----------------------" "----------"
     awk -F'\t' '
-        NF == 3 {
+        NF >= 3 {
             host=$2; action=$3; date=$1
-            if (action=="backup"             && (!(host in b)  || date>b[host]))  b[host]=date
-            if (action=="localfolders-backup" && (!(host in lf) || date>lf[host])) lf[host]=date
-            if (action=="restore"            && (!(host in r)  || date>r[host]))  r[host]=date
+            status=(NF >= 4 ? $4 : "ok")
+            if (action=="backup"             && (!(host in b)  || date>b[host]))  { b[host]=date;  bs[host]=status }
+            if (action=="localfolders-backup" && (!(host in lf) || date>lf[host])) { lf[host]=date; ls[host]=status }
+            if (action=="restore"            && (!(host in r)  || date>r[host]))  { r[host]=date;  rs[host]=status }
+            if (!(host in last) || date>last[host]) { last[host]=date; lasts[host]=status }
             seen[host]=1
         }
         END {
             for (host in seen)
-                printf "%s\t%s\t%s\t%s\n", host, (host in b ? b[host] : "-"), (host in lf ? lf[host] : "-"), (host in r ? r[host] : "-")
+                printf "%s\t%s\t%s\t%s\t%s\n", host,
+                    (host in b ? b[host] : "-"),
+                    (host in lf ? lf[host] : "-"),
+                    (host in r ? r[host] : "-"),
+                    (host in lasts ? lasts[host] : "-")
         }
-    ' "${sources[@]}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate; do
-        printf '  %-20s  %-22s  %-22s  %-22s\n' "${host}" "${bdate}" "${lfdate}" "${rdate}"
+    ' "${sources[@]}" | sort | while IFS=$'\t' read -r host bdate lfdate rdate status; do
+        printf '  %-20s  %-22s  %-22s  %-22s  %-10s\n' "${host}" "${bdate}" "${lfdate}" "${rdate}" "${status}"
     done
 }
 
@@ -113,6 +119,37 @@ query_profile_snapshots_json() {
     else
         RESTIC_REPOSITORY="${repo}" restic snapshots --tag thunderbird-profile --json 2>/dev/null
     fi
+}
+
+repo_stats_summary() {
+    local repo="$1"
+    local pw_file="$2"
+    local tag="$3"
+    local output
+    if [[ -n "${RESTIC_PASSWORD:-}" || -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+        output=$(RESTIC_REPOSITORY="${repo}" restic stats --tag "${tag}" --mode raw-data --json 2>/dev/null)
+    elif [[ -f "${pw_file}" ]]; then
+        output=$(RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${pw_file}" restic stats --tag "${tag}" --mode raw-data --json 2>/dev/null)
+    else
+        return 1
+    fi
+    [[ -n "${output}" ]] || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+size = s.get("total_size") or 0
+snaps = s.get("snapshots_count") or 0
+def human(n):
+    for unit in ("B","KiB","MiB","GiB","TiB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+print(f"{human(size)} raw, {snaps} snapshots")
+' <<< "${output}"
 }
 
 latest_snapshot_time() {
@@ -158,6 +195,7 @@ except Exception:
 for snapshot in snapshots:
     host = snapshot.get("hostname") or snapshot.get("host") or "unknown"
     timestamp = snapshot.get("time") or ""
+    short_id = snapshot.get("short_id") or (snapshot.get("id") or "")[:8]
     if not timestamp:
         continue
     timestamp = timestamp.replace("Z", "+00:00")
@@ -166,7 +204,7 @@ for snapshot in snapshots:
         timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         timestamp = timestamp[:19].replace("T", " ")
-    print(f"{timestamp}\t{host}\tlocalfolders-backup")
+    print(f"{timestamp}\t{host}\tlocalfolders-backup\tok\t{short_id}")
 '
 }
 
@@ -219,30 +257,13 @@ else
     tb_role="review"
 fi
 
-# ── Backup manifest ───────────────────────────────────────────────────────────
-manifest_date=""
-manifest_profile=""
-manifest_files=""
-manifest_profile_size=""
-if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/thunderbird/.backup_manifest" ]]; then
-    mf="${pcloud_backup_root}/thunderbird/.backup_manifest"
-    manifest_date=$(awk -F= '/^date=/{print $2}' "${mf}")
-    manifest_profile=$(awk -F= '/^profile=/{print $2}' "${mf}")
-    manifest_files=$(awk -F= '/^file_count=/{print $2}' "${mf}")
-    manifest_profile_size=$(awk -F= '/^profile_size=/{print $2}' "${mf}")
-fi
-
-# ── Sizes ─────────────────────────────────────────────────────────────────────
-pcloud_backup_size=""
-if [[ -n "${pcloud_backup_root}" && -d "${pcloud_backup_root}" ]]; then
-    pcloud_backup_size=$(du -sh "${pcloud_backup_root}" 2>/dev/null | cut -f1 || true)
-fi
-
-if [[ -d "${local_staging}" ]]; then
-    local_staging_size=$(du -sh "${local_staging}" 2>/dev/null | cut -f1 || true)
-    local_staging_label="present (${local_staging_size})"
+# ── Aux staging ───────────────────────────────────────────────────────────────
+aux_dir="${local_staging}/aux"
+if [[ -d "${aux_dir}" ]]; then
+    aux_size=$(du -sh "${aux_dir}" 2>/dev/null | cut -f1 || true)
+    aux_staging_label="present (${aux_size})"
 else
-    local_staging_label="absent"
+    aux_staging_label="absent"
 fi
 
 # ── Last restore ──────────────────────────────────────────────────────────────
@@ -251,6 +272,8 @@ last_restore=""
 
 # ── Profile snapshot status ──────────────────────────────────────────────────
 profile_snapshot_label="not configured"
+profile_repo_stats="(unavailable)"
+profile_snapshot_latest=""
 profile_repo="${pcloud_backup_root:+${pcloud_backup_root}/${default_profile_repo_subdir}}"
 profile_pw_file="${pcloud_backup_root:+${pcloud_backup_root}/.restic-password}"
 if [[ -n "${profile_repo}" ]]; then
@@ -263,13 +286,14 @@ if [[ -n "${profile_repo}" ]]; then
     else
         if profile_snapshot_latest=$(query_profile_snapshots_json "${profile_repo}" "${profile_pw_file}" | latest_snapshot_time); then
             if [[ -n "${profile_snapshot_latest}" ]]; then
-                profile_snapshot_label="${profile_snapshot_latest} (restic)"
+                profile_snapshot_label="${profile_snapshot_latest}"
             else
                 profile_snapshot_label="no snapshots"
             fi
         else
             profile_snapshot_label="snapshots unavailable"
         fi
+        profile_repo_stats=$(repo_stats_summary "${profile_repo}" "${profile_pw_file}" thunderbird-profile 2>/dev/null || echo "(unavailable)")
     fi
 fi
 
@@ -277,7 +301,7 @@ fi
 this_host_last_backup=""
 if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/activity.log" ]]; then
     this_host_last_backup=$(awk -F'\t' -v host="$(hostname -s)" '
-        NF == 3 && $2 == host && $3 == "backup" {
+        NF >= 3 && $2 == host && $3 == "backup" {
             if ($1 > last) last = $1
         }
         END { if (last != "") print last }
@@ -293,7 +317,7 @@ lf_pw_file="${pcloud_backup_root:+${pcloud_backup_root}/.restic-password}"
 
 if [[ -n "${pcloud_backup_root}" && -f "${pcloud_backup_root}/activity.log" ]]; then
     lf_activity_latest=$(awk -F'\t' '
-        NF == 3 && $3 == "localfolders-backup" {
+        NF >= 3 && $3 == "localfolders-backup" {
             if ($1 > last) last = $1
         }
         END { if (last != "") print last }
@@ -302,6 +326,7 @@ else
     lf_activity_latest=""
 fi
 
+lf_repo_stats="(unavailable)"
 if [[ -n "${lf_repo}" ]]; then
     if [[ ! -f "${lf_repo}/config" ]]; then
         lf_repo_status="repo missing"
@@ -324,6 +349,7 @@ if [[ -n "${lf_repo}" ]]; then
             lf_snapshot_latest=""
             lf_repo_status="snapshots unavailable"
         fi
+        lf_repo_stats=$(repo_stats_summary "${lf_repo}" "${lf_pw_file}" local-folders 2>/dev/null || echo "(unavailable)")
     fi
 fi
 
@@ -344,14 +370,14 @@ fi
 # ── Restore status ────────────────────────────────────────────────────────────
 if [[ -z "${pcloud_backup_root}" ]]; then
     restore_status="Unknown (pCloud not mounted)"
-elif [[ -z "${manifest_date}" ]]; then
-    restore_status="Unknown (no backup manifest)"
-elif [[ -n "${this_host_last_backup}" && ! "${this_host_last_backup}" < "${manifest_date}" ]]; then
-    restore_status="Up to date (this machine created the current backup)"
+elif [[ -z "${profile_snapshot_latest}" ]]; then
+    restore_status="Unknown (no profile snapshots)"
+elif [[ -n "${this_host_last_backup}" && ! "${this_host_last_backup}" < "${profile_snapshot_latest}" ]]; then
+    restore_status="Up to date (this machine created the current snapshot)"
 elif [[ -z "${last_restore}" ]]; then
     restore_status="Restore needed (never restored on this machine)"
-elif [[ "${last_restore}" < "${manifest_date}" ]]; then
-    restore_status="Restore needed (backup is newer than last restore)"
+elif [[ "${last_restore}" < "${profile_snapshot_latest}" ]]; then
+    restore_status="Restore needed (snapshot is newer than last restore)"
 else
     restore_status="Up to date"
 fi
@@ -367,16 +393,13 @@ cat <<EOF
   Running:            ${tb_running}
   Role:               ${tb_role}
 
-  --- Backup ---
+  --- Backups ---
   Storage:            pCloud sync (${pcloud_label})
-  Profile snapshot:   ${profile_snapshot_label}
-  Current mirror:     ${manifest_date:-(none)}
-  Profile:            ${manifest_profile:-(unknown)}
-  Files:              ${manifest_files:-(unknown)}
-  Profile size:       ${manifest_profile_size:-(unknown)}
+  Profile repo:       ${profile_repo_stats}
+  Last profile snap:  ${profile_snapshot_label}
+  LF repo:            ${lf_repo_stats}
   Last LF backup:     ${lf_backup_label}
-  pCloud backup size: ${pcloud_backup_size:-(unavailable)}
-  Local staging:      ${local_staging_label}
+  Aux staging:        ${aux_staging_label}
 
   --- This Machine ---
   Last restore:       ${last_restore:-(never)}

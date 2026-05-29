@@ -590,7 +590,7 @@ def cmd_apply(dry_run: bool = False, no_review: bool | None = None, yes: bool = 
         else:
             clear_queue()
     print()
-    print("Done. Start Thunderbird to load the updated filters.")
+    print("tbblock-rebuild: Done. Start Thunderbird to load the updated filters.")
     return 0
 
 
