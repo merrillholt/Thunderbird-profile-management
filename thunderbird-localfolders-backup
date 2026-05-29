@@ -154,6 +154,12 @@ find_flatpak_thunderbird() {
     return 1
 }
 
+check_thunderbird_running() {
+    pgrep -x thunderbird &>/dev/null || \
+    pgrep -x thunderbird-bin &>/dev/null || \
+    { command -v flatpak &>/dev/null && flatpak ps --columns=application 2>/dev/null | grep -Eq '^(org\.mozilla\.thunderbird_esr|org\.mozilla\.thunderbird|org\.mozilla\.Thunderbird)$'; }
+}
+
 if TB_FLATPAK_APP_ID=$(find_flatpak_thunderbird); then
     tb_dir="${HOME}/.var/app/${TB_FLATPAK_APP_ID}/.thunderbird"
 elif command -v snap &>/dev/null && run_quick_check snap list thunderbird; then
@@ -176,11 +182,15 @@ profile_path=$(python3 "${SCRIPT_DIR}/thunderbird_profile.py" "${tb_dir}") || {
     echo "Error: Could not determine active Thunderbird profile from ${tb_dir}/profiles.ini" >&2
     exit 1
 }
-active_profile=$(basename "${profile_path}")
 
 local_folders="${profile_path}/Mail/Local Folders"
 if [[ ! -d "${local_folders}" ]]; then
     echo "Error: Local Folders directory not found: ${local_folders}" >&2
+    exit 1
+fi
+
+if ! "${dry_run}" && check_thunderbird_running; then
+    echo "Error: Thunderbird is running. Close it before backing up Local Folders." >&2
     exit 1
 fi
 

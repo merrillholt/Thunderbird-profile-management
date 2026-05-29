@@ -314,7 +314,6 @@ if [[ "${meta_status}" -ne 0 || -z "${snapshot_meta}" ]]; then
 fi
 snapshot_short_id="${snapshot_meta%%|*}"
 remaining="${snapshot_meta#*|}"
-snapshot_iso="${remaining%%|*}"
 snapshot_when="${remaining#*|}"
 
 # ── --check ──────────────────────────────────────────────────────────────────
@@ -520,10 +519,8 @@ fi
 src="${src}/"
 
 aux_root=$(find "${snapshot_restore_dir}" -type d -path '*/thunderbird-backup/aux' | head -n1)
-profile_root_src=""
 metadata_src=""
 if [[ -n "${aux_root}" ]]; then
-    [[ -d "${aux_root}/profile-root" ]] && profile_root_src="${aux_root}/profile-root"
     [[ -d "${aux_root}/metadata" ]]     && metadata_src="${aux_root}/metadata"
 fi
 
@@ -579,7 +576,11 @@ if ! "${no_merge}" && ! "${dry_run}" && ! "${self_test}"; then
     if [[ -d "${dest_local}" ]] && [[ -f "${MERGE_HELPER}" ]]; then
         merge_work_dir=$(mktemp -d)
         echo "Preserving local folder messages not in backup..."
-        python3 "${MERGE_HELPER}" snapshot "${src_local}" "${dest_local}" "${merge_work_dir}" || true
+        if ! python3 "${MERGE_HELPER}" snapshot "${src_local}" "${dest_local}" "${merge_work_dir}"; then
+            echo "Error: Could not preserve local-only messages. Restore aborted before overwrite." >&2
+            log_activity "restore" "error" "local-merge-snapshot-failed" "${activity_log}"
+            exit 1
+        fi
         echo
     else
         merge_status="Nothing to preserve (no local folders)"
@@ -614,6 +615,9 @@ else
             merge_status="Complete"
         else
             merge_status="Failed (see output above)"
+            echo "Error: Preserved local messages could not be merged." >&2
+            log_activity "restore" "error" "local-merge-failed" "${activity_log}"
+            exit 1
         fi
         rm -rf "${merge_work_dir}"
         merge_work_dir=""

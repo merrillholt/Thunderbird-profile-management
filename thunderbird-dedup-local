@@ -21,6 +21,16 @@ def message_key(msg: mailbox.mboxMessage) -> str:
     return f"no-mid\x00{msg.get('from', '')}\x00{msg.get('subject', '')}\x00{msg.get('date', '')}"
 
 
+def mbox_files(directory: Path) -> list[Path]:
+    """Return Thunderbird mbox files under a Local Folders tree."""
+    return sorted(
+        p for p in directory.rglob("*")
+        if p.is_file()
+        and p.suffix == ""
+        and p.name not in SKIP_NAMES
+    )
+
+
 def dedup_folder(path: Path, apply: bool, verbose: bool) -> tuple[int, int]:
     box = mailbox.mbox(str(path))
     messages = list(box)
@@ -134,10 +144,7 @@ def main() -> None:
         if not local_mail.exists():
             print(f"Error: Local Folders not found at {local_mail}", file=sys.stderr)
             sys.exit(1)
-        folders = sorted(
-            p for p in local_mail.iterdir()
-            if p.is_file() and p.suffix == "" and p.name not in SKIP_NAMES
-        )
+        folders = mbox_files(local_mail)
 
     if not args.apply:
         print("Dry-run — use --apply to remove duplicates\n")

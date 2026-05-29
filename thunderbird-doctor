@@ -245,9 +245,9 @@ echo
 echo "Install Links"
 
 if [[ -d "${HOME}/bin" ]]; then
-    ok "~/bin exists"
+    ok "\$HOME/bin exists"
 else
-    warn "~/bin missing"
+    warn "\$HOME/bin missing"
 fi
 
 for tool in thunderbird-backup thunderbird-restore thunderbird-report thunderbird-localfolders-backup thunderbird-doctor; do
