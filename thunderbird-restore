@@ -468,20 +468,61 @@ fi
 _peek_last_restore=""
 [[ -f "${LAST_RESTORE_FILE}" ]] && _peek_last_restore=$(cat "${LAST_RESTORE_FILE}")
 
-echo "Thunderbird:    ${tb_type}"
-echo "Version:        ${tb_version}"
-echo "Active profile: ${active_profile}"
-echo "Snapshot:       ${snapshot_short_id} (${snapshot_when})"
-echo "Last restore:   ${_peek_last_restore:-(never)}"
-echo "NOTE: pCloud sync must be complete on this machine before restoring."
-if "${dry_run}"; then
-    echo "Dry run: would extract snapshot ${snapshot_short_id} and restore into ${dest}"
+if "${self_test}"; then
+    thunderbird_preflight="not checked (self-test)"
+elif check_thunderbird_running; then
+    thunderbird_preflight="running"
 else
-    echo "Restoring snapshot ${snapshot_short_id} into ${dest}"
+    thunderbird_preflight="closed"
+fi
+
+if "${no_merge}"; then
+    local_merge_preflight="skipped (--no-merge)"
+elif "${dry_run}"; then
+    local_merge_preflight="skipped (dry run)"
+elif "${self_test}"; then
+    local_merge_preflight="skipped (self-test)"
+elif [[ ! -d "${dest%/}/Mail/Local Folders" ]]; then
+    local_merge_preflight="skipped (no local folders in destination)"
+elif [[ ! -f "${MERGE_HELPER}" ]]; then
+    local_merge_preflight="skipped (merge helper missing)"
+else
+    local_merge_preflight="will preserve local-only messages before overwrite"
+fi
+
+if "${dry_run}" || "${self_test}"; then
+    pcloud_sync_preflight="not required"
+else
+    pcloud_sync_preflight="requires confirmation below"
+fi
+
+echo "Restore Preflight"
+echo "  Thunderbird:       ${tb_type}"
+echo "  Version:           ${tb_version}"
+echo "  Thunderbird state: ${thunderbird_preflight}"
+echo "  Source snapshot:   ${snapshot_short_id} (${snapshot_when})"
+echo "  Destination root:  ${tb_dir}"
+echo "  Destination profile: ${active_profile}"
+echo "  Destination path:  ${dest}"
+echo "  Last restore:      ${_peek_last_restore:-(never)}"
+echo "  Local merge:       ${local_merge_preflight}"
+echo "  pCloud sync:       ${pcloud_sync_preflight}"
+if "${dry_run}"; then
+    echo "  Mode:              dry run; would extract snapshot and restore into a temporary destination"
+else
+    echo "  Mode:              restore; current destination profile will be overwritten"
 fi
 echo
 
 if ! "${dry_run}" && ! "${self_test}"; then
+    read -rp "Has pCloud finished syncing on this machine? [y/N] " confirm_sync
+    if [[ "${confirm_sync}" != [yY] ]]; then
+        echo "Restore cancelled."
+        log_activity "restore" "cancelled" "pcloud-sync-not-confirmed" "${activity_log}"
+        exit 0
+    fi
+    echo "pCloud sync: confirmed by user."
+
     read -rp "This will overwrite the current profile. Continue? [y/N] " confirm
     if [[ "${confirm}" != [yY] ]]; then
         echo "Restore cancelled."

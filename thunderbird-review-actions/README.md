@@ -57,8 +57,10 @@ install-review-actions --uninstall
 The installed copy lives at:
 
 ```
-~/.var/app/org.mozilla.Thunderbird/.thunderbird/<profile>/extensions/thunderbird-review-actions@merrill.local.xpi
+~/.var/app/<Thunderbird Flatpak app id>/.thunderbird/<profile>/extensions/thunderbird-review-actions@merrill.local.xpi
 ```
+
+The installer supports `org.mozilla.thunderbird_esr`, `org.mozilla.thunderbird`, and `org.mozilla.Thunderbird`.
 
 ## Loading for development
 

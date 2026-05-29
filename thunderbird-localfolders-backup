@@ -7,6 +7,7 @@ pcloud_mount="/mnt/pcloud"
 pcloud_drive="${HOME}/pCloudDrive"
 backup_root_rel="Thunderbird Backup"
 default_repo_subdir="localfolders-restic"
+activity_fallback="${HOME}/.local/share/thunderbird-backup/activity.log.fallback"
 
 keep_daily=7
 keep_weekly=4
@@ -15,6 +16,19 @@ keep_monthly=12
 dry_run=false
 subcmd="backup"
 repo_arg=""
+
+log_activity() {
+    local action="$1" status="$2" detail="$3" log_path="$4"
+    local line
+    line=$(printf '%s\t%s\t%s\t%s\t%s' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "${action}" "${status}" "${detail}")
+    if [[ -n "${log_path}" ]] && printf '%s\n' "${line}" >> "${log_path}" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${activity_fallback}")"
+    printf '%s\n' "${line}" >> "${activity_fallback}"
+    echo "Warning: could not write activity log to ${log_path:-(unset)}; appended to ${activity_fallback}" >&2
+    return 0
+}
 
 usage() {
     cat <<EOF
@@ -61,12 +75,6 @@ while (( i < ${#args[@]} )); do
     (( i++ )) || true
 done
 
-if ! command -v restic &>/dev/null; then
-    echo "Error: restic not found. Install it with: sudo apt install restic" >&2
-    echo "  or see https://restic.net" >&2
-    exit 1
-fi
-
 # Resolve pCloud location
 if [[ -d "${pcloud_mount}" ]]; then
     backup_root="${pcloud_mount}/${backup_root_rel}"
@@ -74,6 +82,16 @@ elif [[ -d "${pcloud_drive}" ]]; then
     backup_root="${pcloud_drive}/${backup_root_rel}"
 else
     backup_root=""
+fi
+activity_log="${backup_root}/activity.log"
+
+if ! command -v restic &>/dev/null; then
+    echo "Error: restic not found. Install it with: sudo apt install restic" >&2
+    echo "  or see https://restic.net" >&2
+    if [[ "${subcmd}" == "backup" && "${dry_run}" != true && -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "restic-not-installed" "${activity_log}"
+    fi
+    exit 1
 fi
 
 # Set repository
@@ -168,29 +186,44 @@ elif command -v thunderbird &>/dev/null; then
     tb_dir="${HOME}/.thunderbird"
 else
     echo "Error: No Thunderbird installation found." >&2
+    if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "thunderbird-not-found" "${activity_log}"
+    fi
     exit 1
 fi
 
 profiles_ini="${tb_dir}/profiles.ini"
 if [[ ! -f "${profiles_ini}" ]]; then
     echo "Error: ${profiles_ini} not found." >&2
+    if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "profiles-ini-missing" "${activity_log}"
+    fi
     exit 1
 fi
 
 # Determine active profile path.
 profile_path=$(python3 "${SCRIPT_DIR}/thunderbird_profile.py" "${tb_dir}") || {
     echo "Error: Could not determine active Thunderbird profile from ${tb_dir}/profiles.ini" >&2
+    if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "profile-detect-failed" "${activity_log}"
+    fi
     exit 1
 }
 
 local_folders="${profile_path}/Mail/Local Folders"
 if [[ ! -d "${local_folders}" ]]; then
     echo "Error: Local Folders directory not found: ${local_folders}" >&2
+    if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "local-folders-missing" "${activity_log}"
+    fi
     exit 1
 fi
 
 if ! "${dry_run}" && check_thunderbird_running; then
     echo "Error: Thunderbird is running. Close it before backing up Local Folders." >&2
+    if [[ -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "thunderbird-running" "${activity_log}"
+    fi
     exit 1
 fi
 
@@ -206,8 +239,18 @@ backup_args=(
 )
 "${dry_run}" && backup_args+=(--dry-run)
 
+set +e
 restic "${backup_args[@]}"
+restic_status=$?
+set -e
+
+if [[ "${restic_status}" -ne 0 ]]; then
+    if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
+        log_activity "localfolders-backup" "error" "restic-exit-${restic_status}" "${activity_log}"
+    fi
+    exit "${restic_status}"
+fi
 
 if ! "${dry_run}" && [[ -n "${backup_root}" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname -s)" "localfolders-backup" "ok" "" >> "${backup_root}/activity.log"
+    log_activity "localfolders-backup" "ok" "" "${activity_log}"
 fi

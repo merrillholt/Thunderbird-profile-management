@@ -85,6 +85,7 @@ Run this after applying changes on the review system, after address book changes
 **On the review system:**
 
 ```bash
+# Close Thunderbird first, then:
 thunderbird-backup
 thunderbird-localfolders-backup
 ```
@@ -132,16 +133,25 @@ thunderbird-restore --check
 
 Output:
 ```
-Backup date:   2026-05-04 14:30:00
+Snapshot:      abc12345 (2026-05-04 14:30:00)
 Last restore:  2026-05-03 09:15:00
 NOTE: verify pCloud has finished syncing on this machine before restoring.
-Status:        Restore needed (backup is newer than last restore)
+Status:        Restore needed (snapshot is newer than last restore)
 ```
 
-Exit codes: `0` = up to date, `1` = restore needed, `2` = cannot determine. Usable in scripts:
+Exit codes: `0` = up to date, `1` = restore needed, `2` = cannot determine. If scripting this, only restore on exit code `1`:
 
 ```bash
-thunderbird-restore --check || thunderbird-restore
+set +e
+thunderbird-restore --check
+restore_status=$?
+set -e
+
+case "${restore_status}" in
+  0) echo "Restore not needed." ;;
+  1) thunderbird-restore ;;
+  2) echo "Restore status unknown; investigate before restoring." >&2 ;;
+esac
 ```
 
 The check only requires pCloud to be mounted — it does not inspect the local Thunderbird profile.
@@ -258,6 +268,10 @@ On a **non-review machine** the extension has no Review folder to process. The o
 ## Restic repositories
 
 The review system maintains profile snapshots with `thunderbird-backup` in `Thunderbird Backup/profile-restic/`. Every machine maintains Local Folders snapshots with `thunderbird-localfolders-backup` in `Thunderbird Backup/localfolders-restic/`. Both repos use the shared password file `Thunderbird Backup/.restic-password`.
+
+In these examples, `~/pcloud` is expected to resolve to the local pCloud sync location. The scripts themselves look for `/mnt/pcloud` first, then `$HOME/pCloudDrive`.
+
+`thunderbird-localfolders-backup` refuses to run while Thunderbird is open, because mbox files can be inconsistent while Thunderbird is writing them.
 
 **First-time setup (once, on one machine):**
 
